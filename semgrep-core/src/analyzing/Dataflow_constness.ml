@@ -115,6 +115,15 @@ let refine_constness_ref c_ref c' =
   | None -> c_ref := Some c'
   | Some c -> c_ref := Some (refine c c')
 
+let lookup_env (var : name) env =
+  D.VarMap.find_opt (str_of_name var) env ||| G.NotCst
+
+let update_env (var : name) constness env =
+  let x = str_of_name var in
+  match constness with
+  | G.NotCst -> D.VarMap.remove x env
+  | __else__ -> D.VarMap.add x constness env
+
 (*****************************************************************************)
 (* Constness evaluation *)
 (*****************************************************************************)
@@ -206,11 +215,9 @@ let rec eval (env : G.constness D.env) exp : G.constness =
 and eval_lval env lval =
   match lval with
   | { base = Var x; offset = NoOffset; constness } -> (
-      let opt_c = D.VarMap.find_opt (str_of_name x) env in
-      match (!constness, opt_c) with
-      | None, None -> G.NotCst
-      | Some c, None | None, Some c -> c
-      | Some c1, Some c2 -> refine c1 c2 )
+      match (!constness, lookup_env x env) with
+      | None, c2 -> c2
+      | Some c1, c2 -> refine c1 c2 )
   | ___else___ -> G.NotCst
 
 and eval_op env wop args =
@@ -295,19 +302,19 @@ let transfer :
         (* TODO: Handle base=Mem _ and base=VarSpecial _ cases. *)
         | Assign ({ base = Var var; offset = NoOffset; constness = _ }, exp) ->
             let cexp = eval inp' exp in
-            D.VarMap.add (str_of_name var) cexp inp'
+            update_env var cexp inp'
         | CallSpecial
             ( Some { base = Var var; offset = NoOffset; constness = _ },
               (Concat, _),
               args ) ->
             let cexp = eval_concat inp' args in
-            D.VarMap.add (str_of_name var) cexp inp'
+            update_env var cexp inp'
         | ___else___ -> (
             (* assume non-constant *)
             let lvar_opt = IL.lvar_of_instr_opt instr in
             match lvar_opt with
             | None -> inp'
-            | Some lvar -> D.VarMap.add (str_of_name lvar) G.NotCst inp' ) )
+            | Some lvar -> update_env lvar G.NotCst inp' ) )
   in
 
   { D.in_env = inp'; out_env = out' }
@@ -338,12 +345,9 @@ let update_constness (flow : F.cfg) mapping =
          (* Update RHS constness according to the input env. *)
          rlvals_of_node node.n
          |> List.iter (function
-              | { base = Var var; constness; _ } -> (
-                  match
-                    D.VarMap.find_opt (str_of_name var) ni_info.D.in_env
-                  with
-                  | None -> ()
-                  | Some c -> refine_constness_ref constness c )
+              | { base = Var var; constness; _ } ->
+                  let c = lookup_env var ni_info.D.in_env in
+                  refine_constness_ref constness c
               | ___else___ -> ())
          (* Should not update the LHS constness since in x = E, x is a "ref",
           * and it should not be substituted for the value it holds. *))
