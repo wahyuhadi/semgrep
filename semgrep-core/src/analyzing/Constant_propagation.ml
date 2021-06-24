@@ -364,6 +364,8 @@ let propagate_basic a b =
   Common.profile_code "Constant_propagation.xxx" (fun () -> propagate_basic a b)
 
 let propagate_dataflow ast =
+  let timeout_seconds = 2 in
+  (* For the average function it should take less than a second. *)
   logger#info "Constant_propagation.propagate_dataflow progran";
   let v =
     V.mk_visitor
@@ -371,10 +373,18 @@ let propagate_dataflow ast =
         V.default_visitor with
         V.kfunction_definition =
           (fun (_k, _) def ->
-            let inputs, xs = AST_to_IL.function_definition def in
-            let flow = CFG_build.cfg_of_stmts xs in
-            let mapping = Dataflow_constness.fixpoint inputs flow in
-            Dataflow_constness.update_constness flow mapping);
+            try
+              Common2.timeout_function timeout_seconds (fun () ->
+                  let inputs, xs = AST_to_IL.function_definition def in
+                  let flow = CFG_build.cfg_of_stmts xs in
+                  let mapping = Dataflow_constness.fixpoint inputs flow in
+                  Dataflow_constness.update_constness flow mapping)
+            with Common2.Timeout ->
+              let _, tok = def.fkind in
+              logger#error "Constant propagation timeout: %s at %s"
+                (Parse_info.str_of_info tok)
+                (Parse_info.string_of_info tok);
+              ());
       }
   in
   v (Pr ast)
