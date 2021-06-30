@@ -266,6 +266,7 @@ let map f xs =
       | _ -> n / !ncores
     in
     assert (!ncores > 0 && chunksize > 0);
+    Parmap.disable_core_pinning ();
     Parmap.parmap ~ncores:!ncores ~chunksize f (Parmap.L xs)
 
 (*e: function [[Main_semgrep_core.map]] *)
