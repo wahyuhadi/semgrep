@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Dict
 from typing import List
 
@@ -178,3 +179,9 @@ def lang_is_script(language: Language) -> bool:
             f"Unsupported language: {language} (allows executable scripts?)"
         )
     return is_script
+
+
+def accept_path_for_lang(path: Path, lang: Language) -> bool:
+    # TODO: check if there's an acceptable extension
+    # TODO: or check if the language allows extensionless executable scripts
+    return True

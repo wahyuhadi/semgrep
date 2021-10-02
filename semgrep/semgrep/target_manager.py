@@ -19,8 +19,8 @@ from semgrep.config_resolver import resolve_targets
 from semgrep.error import FilesNotFoundError
 from semgrep.output import OutputHandler
 from semgrep.semgrep_types import Language
+from semgrep.target_manager_extensions import accept_path_for_lang
 from semgrep.target_manager_extensions import ALL_EXTENSIONS
-from semgrep.target_manager_extensions import FileExtension
 from semgrep.target_manager_extensions import lang_to_exts
 from semgrep.util import partition_set
 from semgrep.util import sub_check_output
@@ -109,102 +109,88 @@ class TargetManager:
         return set(path for path in paths if TargetManager._is_valid_file(path))
 
     @staticmethod
-    def _expand_dir(
-        curr_dir: Path, language: Language, respect_git_ignore: bool
-    ) -> Set[Path]:
+    def _list_files_in_dir(curr_dir: Path) -> Set[Path]:
+        """Return set of all files in curr_dir."""
+        return set(p for p in curr_dir.rglob("*") if TargetManager._is_valid_file(p))
+
+    @staticmethod
+    def _parse_output(output: str, curr_dir: Path) -> Set[Path]:
         """
-        Recursively go through a directory and return list of all files with
-        default file extension of language
+        Convert a newline delimited list of files to a set of path objects
+        prepends curr_dir to all paths in said list
+
+        If list is empty then returns an empty set
         """
-
-        def _parse_output(output: str, curr_dir: Path) -> Set[Path]:
-            """
-            Convert a newline delimited list of files to a set of path objects
-            prepends curr_dir to all paths in said list
-
-            If list is empty then returns an empty set
-            """
-            files: Set[Path] = set()
-            if output:
-                files = set(
-                    p
-                    for p in (
-                        Path(curr_dir) / elem for elem in output.strip().split("\n")
-                    )
-                    if TargetManager._is_valid_file(p)
-                )
-            return files
-
-        def _find_files_with_extension(
-            curr_dir: Path, extension: FileExtension
-        ) -> Set[Path]:
-            """
-            Return set of all files in curr_dir with given extension
-            """
-            return set(
+        files: Set[Path] = set()
+        if output:
+            files = set(
                 p
-                for p in curr_dir.rglob(f"*{extension}")
+                for p in (Path(curr_dir) / elem for elem in output.strip().split("\n"))
                 if TargetManager._is_valid_file(p)
             )
+        return files
 
-        extensions = lang_to_exts(language)
+    @staticmethod
+    def _expand_dir(curr_dir: Path, respect_git_ignore: bool) -> Set[Path]:
+        """Recursively go through a directory and return list of all files."""
+
         expanded: Set[Path] = set()
 
-        for ext in extensions:
-            if respect_git_ignore:
-                try:
-                    # Tracked files
-                    tracked_output = sub_check_output(
-                        ["git", "ls-files", f"*{ext}"],
-                        cwd=curr_dir.resolve(),
-                        encoding="utf-8",
-                        stderr=subprocess.DEVNULL,
-                    )
+        if respect_git_ignore:
+            try:
+                # Tracked files
+                tracked_output = sub_check_output(
+                    ["git", "ls-files"],
+                    cwd=curr_dir.resolve(),
+                    encoding="utf-8",
+                    stderr=subprocess.DEVNULL,
+                )
 
-                    # Untracked but not ignored files
-                    untracked_output = sub_check_output(
-                        [
-                            "git",
-                            "ls-files",
-                            "--other",
-                            "--exclude-standard",
-                            f"*{ext}",
-                        ],
-                        cwd=curr_dir.resolve(),
-                        encoding="utf-8",
-                        stderr=subprocess.DEVNULL,
-                    )
+                # Untracked but not ignored files
+                untracked_output = sub_check_output(
+                    [
+                        "git",
+                        "ls-files",
+                        "--other",
+                        "--exclude-standard",
+                    ],
+                    cwd=curr_dir.resolve(),
+                    encoding="utf-8",
+                    stderr=subprocess.DEVNULL,
+                )
 
-                    deleted_output = sub_check_output(
-                        ["git", "ls-files", "--deleted", f"*{ext}"],
-                        cwd=curr_dir.resolve(),
-                        encoding="utf-8",
-                        stderr=subprocess.DEVNULL,
-                    )
-                except (subprocess.CalledProcessError, FileNotFoundError):
-                    logger.verbose(
-                        f"Unable to ignore files ignored by git ({curr_dir} is not a git directory or git is not installed). Running on all files instead..."
-                    )
-                    # Not a git directory or git not installed. Fallback to using rglob
-                    ext_files = _find_files_with_extension(curr_dir, ext)
-                    expanded = expanded.union(ext_files)
-                else:
-                    tracked = _parse_output(tracked_output, curr_dir)
-                    untracked_unignored = _parse_output(untracked_output, curr_dir)
-                    deleted = _parse_output(deleted_output, curr_dir)
-                    expanded = expanded.union(tracked)
-                    expanded = expanded.union(untracked_unignored)
-                    expanded = expanded.difference(deleted)
-
+                deleted_output = sub_check_output(
+                    ["git", "ls-files", "--deleted"],
+                    cwd=curr_dir.resolve(),
+                    encoding="utf-8",
+                    stderr=subprocess.DEVNULL,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                logger.verbose(
+                    f"Unable to ignore files ignored by git ({curr_dir} is not a git directory or git is not installed). Running on all files instead..."
+                )
+                # Not a git directory or git not installed. Fallback to using rglob
+                files = TargetManager._list_files_in_dir(curr_dir)
+                expanded = expanded.union(files)
             else:
-                ext_files = _find_files_with_extension(curr_dir, ext)
-                expanded = expanded.union(ext_files)
+                tracked = TargetManager._parse_output(tracked_output, curr_dir)
+                untracked_unignored = TargetManager._parse_output(
+                    untracked_output, curr_dir
+                )
+                deleted = TargetManager._parse_output(deleted_output, curr_dir)
+                expanded = expanded.union(tracked)
+                expanded = expanded.union(untracked_unignored)
+                expanded = expanded.difference(deleted)
+
+        else:
+            files = TargetManager._list_files_in_dir(curr_dir)
+            expanded = expanded.union(files)
 
         return TargetManager._filter_valid_files(expanded)
 
     @staticmethod
     def expand_targets(
-        targets: Collection[Path], lang: Language, respect_git_ignore: bool
+        targets: Collection[Path], respect_git_ignore: bool
     ) -> Set[Path]:
         """Explore all directories."""
         expanded: Set[Path] = set()
@@ -213,9 +199,7 @@ class TargetManager:
                 continue
 
             if target.is_dir():
-                expanded.update(
-                    TargetManager._expand_dir(target, lang, respect_git_ignore)
-                )
+                expanded.update(TargetManager._expand_dir(target, respect_git_ignore))
             else:
                 expanded.add(target)
 
@@ -239,32 +223,39 @@ class TargetManager:
         return result
 
     @staticmethod
-    def filter_includes(arr: Set[Path], includes: Sequence[str]) -> Set[Path]:
-        """
-        Returns all elements in arr that match any includes pattern
+    def _filter_language(paths: Set[Path], lang: Language) -> Set[Path]:
+        """Return subset of all the files that may be in the language.
 
-        If includes is empty, returns arr unchanged
+        This should catch all the files that might be in the language.
+        Semgrep-core will make a more thorough filtering.
+        """
+        return set(p for p in paths if accept_path_for_lang(p, lang))
+
+    @staticmethod
+    def filter_includes(paths: Set[Path], includes: Sequence[str]) -> Set[Path]:
+        """Return all elements in paths that match any includes pattern.
+
+        If includes is empty, returns paths unchanged
         """
         if not includes:
-            return arr
+            return paths
         includes = TargetManager.preprocess_path_patterns(includes)
         return set(
-            wcglob.globfilter(arr, includes, flags=wcglob.GLOBSTAR | wcglob.DOTGLOB)
+            wcglob.globfilter(paths, includes, flags=wcglob.GLOBSTAR | wcglob.DOTGLOB)
         )
 
     @staticmethod
-    def filter_excludes(arr: Set[Path], excludes: Sequence[str]) -> Set[Path]:
-        """
-        Returns all elements in arr that do not match any excludes pattern
+    def filter_excludes(paths: Set[Path], excludes: Sequence[str]) -> Set[Path]:
+        """Returns all elements in arr that do not match any excludes pattern.
 
         If excludes is empty, returns arr unchanged
         """
         if not excludes:
-            return arr
+            return paths
 
         excludes = TargetManager.preprocess_path_patterns(excludes)
-        return arr - set(
-            wcglob.globfilter(arr, excludes, flags=wcglob.GLOBSTAR | wcglob.DOTGLOB)
+        return paths - set(
+            wcglob.globfilter(paths, excludes, flags=wcglob.GLOBSTAR | wcglob.DOTGLOB)
         )
 
     def filtered_files(self, lang: Language) -> TargetFiles:
@@ -297,12 +288,14 @@ class TargetManager:
                 FilesNotFoundError(tuple(nonexistent_files))
             )
 
-        # Scan file system and filter for language lang.
-        targets = self.expand_targets(directories, lang, self.respect_git_ignore)
+        # Scan file system.
+        all_targets = self.expand_targets(directories, self.respect_git_ignore)
 
-        # Filter based on custom glob patterns.
-        targets = self.filter_includes(targets, self.includes)
-        targets = self.filter_excludes(targets, [*self.excludes, ".git"])
+        # Filter based on file type and custom glob patterns.
+        lang_targets = self._filter_language(all_targets, lang)
+        included_targets = self.filter_includes(all_targets, self.includes)
+        excluded_targets = self.filter_excludes(all_targets, [*self.excludes, ".git"])
+        targets = lang_targets.union(included_targets).difference(excluded_targets)
 
         # Avoid duplicates (e.g. foo/bar can be both an explicit file and
         # discovered in folder foo/)
