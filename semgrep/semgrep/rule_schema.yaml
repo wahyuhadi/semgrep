@@ -386,8 +386,6 @@ properties:
         pattern-either:
           $ref: '#/definitions/pattern-either-content'
 
-      additionalProperties: false
-
       oneOf:
         - properties:
             mode:
