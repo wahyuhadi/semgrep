@@ -1,6 +1,7 @@
 (* Yoann Padioleau
+ * Iago Abal
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2022 r2c
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -37,8 +38,8 @@ module G = AST_generic
  *
  *  - no For/Foreach/DoWhile/While, converted all to Loop,
  *  - no Foreach, converted to a Loop and 2 new special
- *  - TODO no Switch, converted to Ifs
- *  - TODO no Continue/Break, converted to goto
+ *  - no Switch, converted to Ifs
+ *  - no Continue/Break, converted to goto
  *  - less use of expr option (in Return/Assert/...), use Unit in those cases
  *
  *  - no Sgrep constructs
@@ -51,9 +52,12 @@ module G = AST_generic
  * Note that we still want to be close to the original code so that
  * error reported on the IL can be mapped back to error on the original code
  * (source "maps"), or more importantly semantic information computed
- * on the IL (e.g., types, constness) can be mapped back to the generic AST.
+ * on the IL (e.g., types, svalue, match range, taint) can be mapped back
+ * to the generic AST.
  * This is why you will see some 'eorig', 'iorig' fields below and the use of
- * refs such as constness shared with the generic AST.
+ * refs such as svalue shared with the generic AST.
+ * TODO? alt: store just the range and id_info_id, so easy to propagate back
+ * info to generic AST or to return match ranges to semgrep.
  *
  * history:
  *  - cst_php.ml (was actually called ast_php.ml)
@@ -82,7 +86,6 @@ module G = AST_generic
 
 (* the classic *)
 type tok = G.tok [@@deriving show]
-
 type 'a wrap = 'a G.wrap [@@deriving show]
 
 (* useful mainly for empty containers *)
@@ -95,14 +98,15 @@ type 'a bracket = tok * 'a * tok [@@deriving show]
 type ident = G.ident [@@deriving show]
 
 (* 'sid' below is the result of name resolution and variable disambiguation
- * using a gensym (see Naming_AST.ml). The pair is guaranteed to be
+ * using a gensym (see Naming_AST.ml). A name is guaranteed to be
  * global and unique (no need to handle variable shadowing, block scoping,
  * etc; this has been done already).
  * TODO: use it to also do SSA! so some control-flow insensitive analysis
  * can become control-flow sensitive? (e.g., DOOP)
  *
  *)
-type name = ident * G.sid [@@deriving show]
+type name = { ident : ident; sid : G.sid; id_info : G.id_info }
+[@@deriving show]
 
 (*****************************************************************************)
 (* Fixme constructs *)
@@ -118,17 +122,39 @@ type fixme_kind =
 [@@deriving show]
 
 (*****************************************************************************)
+(* Mapping back to Generic *)
+(*****************************************************************************)
+
+(* Only use `SameAs` when the IL expression or instruction is indeed "the same as"
+ * (i.e., semantically equivalent to) that Generic expression.
+ *
+ * When an IL expression is derived from some other Generic expression or
+ * construct, but not semantically equivalent, you can use `Related`. Note that
+ * this info will be used by taint-tracking to match sources/sanitizers/sinks;
+ * so make sure that the annotation makes sense, or it could lead to weird taint
+ * findings.
+ *
+ * When no orig info is needed, or it cannot be provided, then use NoOrig. For
+ * example, auxiliary assignments where the RHS has the right orig-info can be
+ * annotated with NoOrig. This also helps making -dump_il more readable.
+ *)
+type orig = SameAs of G.expr | Related of G.any | NoOrig
+[@@deriving show { with_path = false }]
+
+let related_tok tok = Related (G.Tk tok)
+let related_exp exp_gen = Related (G.E exp_gen)
+
+let any_of_orig = function
+  | SameAs e -> G.E e
+  | Related any -> any
+  | NoOrig -> G.Anys []
+
+(*****************************************************************************)
 (* Lvalue *)
 (*****************************************************************************)
 
 (* An lvalue, represented as in CIL as a pair. *)
-type lval = {
-  base : base;
-  offset : offset;
-  constness : G.constness option ref;
-      (* THINK: Drop option? *)
-      (* todo: ltype: typ; *)
-}
+type lval = { base : base; offset : offset }
 
 and base =
   | Var of name
@@ -169,7 +195,7 @@ and var_special = This | Super | Self | Parent
  * Here 'exp' does not contain any side effect!
  * todo: etype: typ;
  *)
-and exp = { e : exp_kind; eorig : G.expr }
+and exp = { e : exp_kind; eorig : orig }
 
 and exp_kind =
   | Fetch of lval (* lvalue used in a rvalue context *)
@@ -182,12 +208,17 @@ and exp_kind =
    * with Dot? simpler?
    * This could also be used for Dict.
    *)
-  | Record of (ident * exp) list
+  | Record of field list
   | Cast of G.type_ * exp
   (* This could be put in call_special, but dumped IL are then less readable
    * (they are too many intermediate _tmp variables then) *)
   | Operator of G.operator wrap * exp list
-  | FixmeExp of fixme_kind * G.any
+  | FixmeExp of
+      fixme_kind
+      * G.any (* fixme source *)
+      * exp (* partial translation *) option
+
+and field = Field of ident * exp | Spread of exp
 
 and composite_kind =
   | CTuple
@@ -207,7 +238,7 @@ type argument = exp [@@deriving show]
 (* Easier type to compute lvalue/rvalue set of a too general 'expr', which
  * is now split into  instr vs exp vs lval.
  *)
-type instr = { i : instr_kind; iorig : G.expr }
+type instr = { i : instr_kind; iorig : orig }
 
 and instr_kind =
   (* was called Set in CIL, but a bit ambiguous with Set module *)
@@ -220,12 +251,8 @@ and instr_kind =
 
 and call_special =
   | Eval
-  (* Note that in some languages (e.g., Python) some regular calls are
-   * actually New under the hood.
-   * The type_ argument is usually a name, but it can also be an name[] in
-   * Java/C++.
-   *)
-  | New (* TODO: lift up and add 'of type_ * argument list'? *)
+  (* TODO: lift up like in AST_generic *)
+  | New
   | Typeof
   | Instanceof
   | Sizeof
@@ -248,14 +275,13 @@ and call_special =
    | StringAccess of string (* for records/hashes *)
 *)
 and anonymous_entity =
-  | Lambda of G.function_definition
+  | Lambda of function_definition
   | AnonClass of G.class_definition
-[@@deriving show { with_path = false }]
 
 (*****************************************************************************)
 (* Statement *)
 (*****************************************************************************)
-type stmt = { s : stmt_kind (* sorig: G.stmt; ?*) }
+and stmt = { s : stmt_kind (* sorig: G.stmt; ?*) }
 
 and stmt_kind =
   | Instr of instr
@@ -271,23 +297,32 @@ and stmt_kind =
   (* alt: do as in CIL and resolve that directly in 'Goto of stmt' *)
   | Goto of tok * label
   | Label of label
-  | Try of stmt list * (name * stmt list) list (* catches *) * stmt list (* finally *)
+  | Try of
+      stmt list
+      * (name * stmt list) list (* catches *)
+      * stmt list (* finally *)
   | Throw of tok * exp (* less: enforce lval here? *)
   | MiscStmt of other_stmt
   | FixmeStmt of fixme_kind * G.any
 
 and other_stmt =
-  (* everything except VarDef (which is transformed in a Set instr) *)
+  (* everything except VarDef (which is transformed in an Assign instr) *)
   | DefStmt of G.definition
   | DirectiveStmt of G.directive
-  | Noop
+  | Noop of (* for debugging purposes *) string
 
-and label = ident * G.sid [@@deriving show { with_path = false }]
+and label = ident * G.sid
 
 (*****************************************************************************)
 (* Defs *)
 (*****************************************************************************)
 (* See AST_generic.ml *)
+and function_definition = {
+  foarams : name list;
+  frettype : G.type_ option;
+  fbody : stmt list;
+}
+[@@deriving show { with_path = false }]
 
 (*****************************************************************************)
 (* Control-flow graph (CFG) *)
@@ -320,7 +355,6 @@ and node_kind =
  * (we may use more? the "ShadowNode" idea of Julia Lawall?)
  *)
 type edge = Direct
-
 type cfg = (node, edge) CFG.t
 
 (* an int representing the index of a node in the graph *)
@@ -336,122 +370,10 @@ type any = L of lval | E of exp | I of instr | S of stmt | Ss of stmt list
 (*****************************************************************************)
 (* L/Rvalue helpers *)
 (*****************************************************************************)
-let lval_of_instr_opt x =
-  match x.i with
-  | Assign (lval, _)
-  | AssignAnon (lval, _)
-  | Call (Some lval, _, _)
-  | CallSpecial (Some lval, _, _) ->
-      Some lval
-  | Call _
-  | CallSpecial _ ->
-      None
-  | FixmeInstr _ -> None
-
-let lvar_of_instr_opt x =
-  let open Common in
-  lval_of_instr_opt x >>= fun lval ->
-  match lval.base with
-  | Var n -> Some n
-  | VarSpecial _
-  | Mem _ ->
-      None
-
-let exps_of_instr x =
-  match x.i with
-  | Assign (_, exp) -> [ exp ]
-  | AssignAnon _ -> []
-  | Call (_, e1, args) -> e1 :: args
-  | CallSpecial (_, _, args) -> args
-  | FixmeInstr _ -> []
-
-let rexps_of_instr x =
-  match x.i with
-  | Assign (_, exp) -> [ exp ]
-  | AssignAnon _ -> []
-  | Call (_, e1, args) -> e1 :: args
-  | CallSpecial (_, _, args) -> args
-  | FixmeInstr _ -> []
-
-(* opti: could use a set *)
-let rec lvals_of_exp e =
-  match e.e with
-  | Fetch lval -> lval :: lvals_in_lval lval
-  | Literal _ -> []
-  | Cast (_, e) -> lvals_of_exp e
-  | Composite (_, (_, xs, _))
-  | Operator (_, xs) ->
-      lvals_of_exps xs
-  | Record ys -> lvals_of_exps (ys |> List.map snd)
-  | FixmeExp _ -> []
-
-and lvals_in_lval lval =
-  let base_lvals =
-    match lval.base with
-    | Mem e -> lvals_of_exp e
-    | _else_ -> []
-  in
-  let offset_lvals =
-    match lval.offset with
-    | Index e -> lvals_of_exp e
-    | __else_ -> []
-  in
-  base_lvals @ offset_lvals
-
-and lvals_of_exps xs = xs |> List.map lvals_of_exp |> List.flatten
-
-(** The lvals in the RHS of the instruction. *)
-let rlvals_of_instr x =
-  let exps = rexps_of_instr x in
-  lvals_of_exps exps
-
-let rvars_of_instr x =
-  x |> rlvals_of_instr
-  |> Common.map_filter (function
-       | { base = Var var; _ } -> Some var
-       | ___else___ -> None)
-
-let rlvals_of_node = function
-  | Enter
-  | Exit
-  | TrueNode
-  | FalseNode
-  | NGoto _
-  | Join ->
-      []
-  | NInstr x -> rlvals_of_instr x
-  | NCond (_, e)
-  | NReturn (_, e)
-  | NThrow (_, e) ->
-      lvals_of_exp e
-  | NOther _
-  | NTodo _ ->
-      []
-
-let lval_of_node_opt = function
-  | NInstr x -> lval_of_instr_opt x
-  | Enter
-  | Exit
-  | TrueNode
-  | FalseNode
-  | NGoto _
-  | Join
-  | NCond _
-  | NReturn _
-  | NThrow _
-  | NOther _
-  | NTodo _ ->
-      None
+(* see IL_lvalue_helpers.ml *)
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
-let str_of_name ((s, _tok), _sid) = s
-
-let find_node f cfg =
-  cfg#nodes#tolist
-  |> Common.find_some (fun (nodei, node) -> if f node then Some nodei else None)
-
-let find_exit cfg = find_node (fun node -> node.n = Exit) cfg
-
-let find_enter cfg = find_node (fun node -> node.n = Enter) cfg
+let str_of_name name = fst name.ident
+let str_of_label ((n, _), _) = n

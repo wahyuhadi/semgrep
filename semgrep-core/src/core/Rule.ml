@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2022 r2c
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,6 +12,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * license.txt for more details.
  *)
+open Common
 module G = AST_generic
 module MV = Metavariable
 
@@ -22,8 +23,6 @@ module MV = Metavariable
  *
  * See also Mini_rule.ml where formula and many other features disappear.
  *
- * TODO:
- *  - parse equivalences
  *)
 
 (*****************************************************************************)
@@ -34,7 +33,6 @@ module MV = Metavariable
  * error location when a rule is malformed.
  *)
 type tok = AST_generic.tok [@@deriving show, eq, hash]
-
 type 'a wrap = 'a AST_generic.wrap [@@deriving show, eq, hash]
 
 (* To help report pattern errors in simple mode in the playground *)
@@ -46,91 +44,6 @@ type 'a loc = {
 [@@deriving show, eq]
 
 (*****************************************************************************)
-(* Extended languages *)
-(*****************************************************************************)
-
-(* eXtended language, stored in the languages: field in the rule.
- * less: merge with xpattern_kind? *)
-type xlang =
-  (* for "real" semgrep (the first language is used to parse the pattern) *)
-  | L of Lang.t * Lang.t list
-  (* for pattern-regex (referred as 'regex' or 'none' in languages:) *)
-  | LRegex
-  (* for spacegrep *)
-  | LGeneric
-[@@deriving show, eq]
-
-exception InternalInvalidLanguage of string (* rule id *) * string (* msg *)
-
-(* coupling: Parse_mini_rule.parse_languages *)
-let xlang_of_string ?id:(id_opt = None) s =
-  match s with
-  | "none"
-  | "regex" ->
-      LRegex
-  | "generic" -> LGeneric
-  | _ -> (
-      match Lang.lang_of_string_opt s with
-      | None -> (
-          match id_opt with
-          | None -> failwith (Lang.unsupported_language_message s)
-          | Some id ->
-              raise
-                (InternalInvalidLanguage
-                   (id, Common.spf "unsupported language: %s" s)))
-      | Some l -> L (l, []))
-
-let string_of_xlang = function
-  | L (l, _) -> Lang.string_of_lang l
-  | LRegex -> "regex"
-  | LGeneric -> "generic"
-
-(*****************************************************************************)
-(* Extended patterns *)
-(*****************************************************************************)
-
-type xpattern = {
-  pat : xpattern_kind;
-  (* Regarding @equal below, even if two patterns have different indentation,
-   * we don't care. We rely only on the equality on pat, which will
-   * abstract away line positions.
-   * TODO: right now we have some false positives, e.g., in Python
-   * assert(...) and assert ... are considered equal AST-wise
-   * but it might be a bug!.
-   *)
-  pstr : string wrap; [@equal fun _ _ -> true]
-  (* Unique id, incremented via a gensym()-like function in mk_pat().
-   * This is used to run the patterns in a formula in a batch all-at-once
-   * and remember what was the matching results for a certain pattern id.
-   *)
-  pid : pattern_id; [@equal fun _ _ -> true]
-}
-
-and xpattern_kind =
-  | Sem of Pattern.t * Lang.t (* language used for parsing the pattern *)
-  | Spacegrep of Spacegrep.Pattern_AST.t
-  | Regexp of regexp
-  | Comby of string
-
-and regexp = Regexp_engine.Pcre_engine.t
-
-(* used in the engine for rule->mini_rule and match_result gymnastic *)
-and pattern_id = int [@@deriving show, eq]
-
-(* helpers *)
-
-let count = ref 0
-
-let mk_xpat pat pstr =
-  incr count;
-  { pat; pstr; pid = !count }
-
-let is_regexp xpat =
-  match xpat.pat with
-  | Regexp _ -> true
-  | _ -> false
-
-(*****************************************************************************)
 (* Formula (patterns boolean composition) *)
 (*****************************************************************************)
 
@@ -138,29 +51,38 @@ let is_regexp xpat =
  * The main complication is the handling of metavariables and especially
  * negation in the presence of metavariables.
  *
- * todo? enforce invariant that Not/MetavarCond can only appear in And?
- * move MetavarCond out of leaf in an additional element in And.
+ * less? enforce invariant that Not can only appear in And?
  *)
 type formula =
-  | Leaf of leaf
-  | And of tok * formula list (* see Match_rules.split_and() *)
-  | Or of tok * formula list
-  (* There are currently restrictions on where a Not can appear in a formula.
-   * It must be inside an And to be intersected with "positive" formula.
-   * But this could change? If we were moving to a different range semantic?
-   *)
-  | Not of tok * formula
-
-and leaf =
   (* pattern: and pattern-inside: are actually slightly different so
    * we need to keep the information around.
    * (see tests/OTHER/rules/inside.yaml)
    * The same is true for pattern-not and pattern-not-inside
    * (see tests/OTHER/rules/negation_exact.yaml)
    *)
-  | P of xpattern (* a leaf pattern *) * inside option
-  (* This can also only appear inside an And *)
-  | MetavarCond of tok * metavar_cond
+  | P of Xpattern.t (* a leaf pattern *) * inside option
+  | And of conjunction
+  | Or of tok * formula list
+  (* There are currently restrictions on where a Not can appear in a formula.
+   * It must be inside an And to be intersected with "positive" formula.
+   * TODO? Could this change if we were moving to a different range semantic?
+   *)
+  | Not of tok * formula
+
+(* The conjuncts must contain at least
+ * one positive "term" (unless it's inside a CondNestedFormula, in which
+ * case there is not such a restriction).
+ * See also split_and().
+ *)
+and conjunction = {
+  tok : tok;
+  (* pattern-inside:'s and pattern:'s *)
+  conjuncts : formula list;
+  (* metavariable-xyz:'s *)
+  conditions : (tok * metavar_cond) list;
+  (* focus-metavariable:'s *)
+  focus : (tok * MV.mvar) list;
+}
 
 (* todo: try to remove this at some point, but difficult. See
  * https://github.com/returntocorp/semgrep/issues/1218
@@ -178,9 +100,11 @@ and metavar_cond =
    * update: this is also useful to keep separate from CondEval for
    * the "regexpizer" optimizer (see Analyze_rule.ml).
    *)
-  | CondRegexp of MV.mvar * regexp
-  | CondNestedFormula of MV.mvar * xlang option * formula
-[@@deriving show, eq]
+  | CondRegexp of MV.mvar * Xpattern.regexp * bool (* constant-propagation *)
+  | CondAnalysis of MV.mvar * metavar_analysis_kind
+  | CondNestedFormula of MV.mvar * Xlang.t option * formula
+
+and metavar_analysis_kind = CondEntropy | CondReDoS [@@deriving show, eq]
 
 (*****************************************************************************)
 (* Old Formula style *)
@@ -191,26 +115,33 @@ and metavar_cond =
  *)
 type formula_old =
   (* pattern: *)
-  | Pat of xpattern
+  | Pat of Xpattern.t
   (* pattern-not: *)
-  | PatNot of tok * xpattern
+  | PatNot of tok * Xpattern.t
+  (* metavariable-xyz: *)
   | PatExtra of tok * extra
+  (* focus-metavariable: *)
+  | PatFocus of tok * MV.mvar
   (* pattern-inside: *)
-  | PatInside of xpattern
+  | PatInside of Xpattern.t
   (* pattern-not-inside: *)
-  | PatNotInside of tok * xpattern
+  | PatNotInside of tok * Xpattern.t
   (* pattern-either: Or *)
   | PatEither of tok * formula_old list
   (* patterns: And *)
   | Patterns of tok * formula_old list
+  (* for fields handled in Python like depends-on *)
+  | PatFilteredInPythonTodo of tok
 
 (* extra conditions, usually on metavariable content *)
 and extra =
-  | MetavarRegexp of MV.mvar * regexp
-  | MetavarPattern of MV.mvar * xlang option * formula
+  | MetavarRegexp of MV.mvar * Xpattern.regexp * bool
+  | MetavarPattern of MV.mvar * Xlang.t option * formula_old
   | MetavarComparison of metavariable_comparison
-  (* arbitrary code! dangerous! *)
-  | PatWherePython of string
+  | MetavarAnalysis of MV.mvar * metavar_analysis_kind
+(* old: | PatWherePython of string, but it was too dangerous.
+ * MetavarComparison is not as powerful, but safer.
+ *)
 
 (* See also engine/Eval_generic.ml *)
 and metavariable_comparison = {
@@ -223,45 +154,68 @@ and metavariable_comparison = {
 }
 [@@deriving show, eq]
 
+(*****************************************************************************)
+(* Final formula *)
+(*****************************************************************************)
+
 (* pattern formula *)
 type pformula = New of formula | Old of formula_old [@@deriving show, eq]
+
+(*****************************************************************************)
+(* Taint-specific types *)
+(*****************************************************************************)
+
+type sanitizer_spec = {
+  not_conflicting : bool;
+      (** If [not_conflicting] is enabled, the sanitizer cannot conflict with
+    a sink or a source (i.e., match the exact same range) otherwise
+    it is filtered out. This allows to e.g. declare `$F(...)` as a sanitizer,
+    to assume that any other function will handle tainted data safely.
+    Without this, `$F(...)` would automatically sanitize any other function
+    call acting as a sink or a source. *)
+  pformula : pformula;
+}
+[@@deriving show]
+
+type taint_propagator = {
+  formula : pformula;
+  from : MV.mvar wrap;
+  to_ : MV.mvar wrap;
+}
+[@@deriving show]
+(** e.g. if we want to specify that adding tainted data to a `HashMap` makes the
+ * `HashMap` tainted too, then "formula" could be `(HashMap $H).add($X)`,
+ * with "from" being `$X` and "to" being `$H`. So if `$X` is tainted then `$H`
+ * will also be marked as tainted. *)
+
+type taint_spec = {
+  sources : pformula list;
+  propagators : taint_propagator list;
+  sanitizers : sanitizer_spec list;
+  sinks : pformula list;
+}
+[@@deriving show]
 
 (*****************************************************************************)
 (* The rule *)
 (*****************************************************************************)
 
-(* alt:
- *     type common = { id : string; ... }
- *     type search = { common : common; formula : pformula; }
- *     type taint  = { common : common; spec : taint_spec; }
- *     type rule   = Search of search | Taint of taint
- *)
-
-type taint_spec = {
-  sources : pformula list;
-  sanitizers : pformula list;
-  sinks : pformula list;
-}
-[@@deriving show]
-
-type mode = Search of pformula | Taint of taint_spec [@@deriving show]
-
 (* TODO? just reuse Error_code.severity *)
-type severity = Error | Warning | Info [@@deriving show]
+type severity = Error | Warning | Info | Inventory [@@deriving show]
 
-type rule = {
+type 'mode rule_info = {
   (* MANDATORY fields *)
   id : rule_id wrap;
-  mode : mode;
+  mode : 'mode;
   message : string;
   severity : severity;
-  languages : xlang;
+  languages : Xlang.t;
   (* OPTIONAL fields *)
   options : Config_semgrep.t option;
   (* deprecated? todo: parse them *)
   equivalences : string list option;
   fix : string option;
-  fix_regexp : (regexp * int option * string) option;
+  fix_regexp : (Xpattern.regexp * int option * string) option;
   paths : paths option;
   (* ex: [("owasp", "A1: Injection")] but can be anything *)
   metadata : JSON.t option;
@@ -276,36 +230,115 @@ and paths = {
 }
 [@@deriving show]
 
+type search_mode = [ `Search of pformula ] [@@deriving show]
+type taint_mode = [ `Taint of taint_spec ] [@@deriving show]
+type mode = [ search_mode | taint_mode ] [@@deriving show]
+type search_rule = search_mode rule_info [@@deriving show]
+type taint_rule = taint_mode rule_info [@@deriving show]
+type rule = mode rule_info [@@deriving show]
+
 (* alias *)
 type t = rule [@@deriving show]
-
 type rules = rule list [@@deriving show]
+
+(*****************************************************************************)
+(* Helpers *)
+(*****************************************************************************)
+
+let partition_rules (rules : rules) : search_rule list * taint_rule list =
+  rules
+  |> Common.partition_either (fun r ->
+         match r.mode with
+         | `Search _ as s -> Left { r with mode = s }
+         | `Taint _ as t -> Right { r with mode = t })
 
 (*****************************************************************************)
 (* Error Management *)
 (*****************************************************************************)
 
-exception InvalidLanguage of rule_id * string * Parse_info.t
+(* This is used to let the user know which rule the engine was using when
+ * a Timeout or OutOfMemory exn occured.
+ *)
+let (last_matched_rule : rule_id option ref) = ref None
 
-(* TODO: the Parse_info.t is not precise for now, it corresponds to the
- * start of the pattern *)
-exception
-  InvalidPattern of
-    rule_id * string * xlang * string (* exn *) * Parse_info.t * string list
+(* Those are recoverable errors; We can just skip the rules containing
+ * those errors.
+ * less: use a record
+ * alt: put in Output_from_core.atd?
+ *)
+type invalid_rule_error = invalid_rule_error_kind * rule_id * Parse_info.t
 
-exception InvalidRegexp of rule_id * string * Parse_info.t
+and invalid_rule_error_kind =
+  | InvalidLanguage of string (* the language string *)
+  (* TODO: the Parse_info.t for InvalidPattern is not precise for now;
+   * it corresponds to the start of the pattern *)
+  | InvalidPattern of
+      string (* pattern *)
+      * Xlang.t
+      * string (* exn *)
+      * string list (* yaml path *)
+  | InvalidRegexp of string (* PCRE error message *)
+  | DeprecatedFeature of string (* e.g., pattern-where-python: *)
+  | MissingPositiveTermInAnd
+  | InvalidOther of string
 
-(* general errors *)
+let string_of_invalid_rule_error_kind = function
+  | InvalidLanguage language -> spf "invalid language %s" language
+  | InvalidRegexp message -> spf "invalid regex %s" message
+  (* coupling: this is actually intercepted in
+   * Semgrep_error_code.exn_to_error to generate a PatternParseError instead
+   * of a RuleParseError *)
+  | InvalidPattern (pattern, xlang, message, _yaml_path) ->
+      spf
+        "Invalid pattern for %s: %s\n\
+         ----- pattern -----\n\
+         %s\n\
+         ----- end pattern -----\n"
+        (Xlang.to_string xlang) message pattern
+  | MissingPositiveTermInAnd ->
+      "you need at least one positive term (not just negations or conditions)"
+  | DeprecatedFeature s -> spf "deprecated feature: %s" s
+  | InvalidOther s -> s
+
+(* General errors
+
+   TODO: define one exception for all this because pattern-matching
+   on exceptions has no exhaustiveness checking.
+*)
+exception InvalidRule of invalid_rule_error
 exception InvalidYaml of string * Parse_info.t
-
 exception DuplicateYamlKey of string * Parse_info.t
-
-(* less: could be merged with InvalidYaml *)
-exception InvalidRule of rule_id * string * Parse_info.t
-
 exception UnparsableYamlException of string
-
 exception ExceededMemoryLimit of string
+
+let string_of_invalid_rule_error ((kind, rule_id, pos) : invalid_rule_error) =
+  spf "invalid rule %s, %s: %s" rule_id
+    (Parse_info.string_of_info pos)
+    (string_of_invalid_rule_error_kind kind)
+
+(*
+   Exception printers for Printexc.to_string.
+*)
+let opt_string_of_exn (exn : exn) =
+  match exn with
+  | InvalidRule x -> Some (string_of_invalid_rule_error x)
+  | InvalidYaml (msg, pos) ->
+      Some (spf "invalid YAML, %s: %s" (Parse_info.string_of_info pos) msg)
+  | DuplicateYamlKey (key, pos) ->
+      Some
+        (spf "invalid YAML, %s: duplicate key %S"
+           (Parse_info.string_of_info pos)
+           key)
+  | UnparsableYamlException s ->
+      (* TODO: what's the string s? *)
+      Some (spf "unparsable YAML: %s" s)
+  | ExceededMemoryLimit s ->
+      (* TODO: what's the string s? *)
+      Some (spf "exceeded memory limit: %s" s)
+  | _ -> None
+
+(* to be called by the application's main() *)
+let register_exception_printer () = Printexc.register_printer opt_string_of_exn
 
 (*****************************************************************************)
 (* Visitor/extractor *)
@@ -313,25 +346,22 @@ exception ExceededMemoryLimit of string
 (* currently used in Check_rule.ml metachecker *)
 let rec visit_new_formula f formula =
   match formula with
-  | Leaf (P (p, _)) -> f p
-  | Leaf (MetavarCond _) -> ()
+  | P (p, _) -> f p
   | Not (_, x) -> visit_new_formula f x
   | Or (_, xs)
-  | And (_, xs) ->
+  | And { conjuncts = xs; _ } ->
       xs |> List.iter (visit_new_formula f)
 
 (* used by the metachecker for precise error location *)
 let tok_of_formula = function
-  | And (t, _)
+  | And { tok = t; _ }
   | Or (t, _)
   | Not (t, _) ->
       t
-  | Leaf (P (p, _)) -> snd p.pstr
-  | Leaf (MetavarCond (t, _)) -> t
+  | P (p, _) -> snd p.pstr
 
 let kind_of_formula = function
-  | Leaf (P _) -> "pattern"
-  | Leaf (MetavarCond _) -> "condition"
+  | P _ -> "pattern"
   | Or _
   | And _
   | Not _ ->
@@ -360,10 +390,96 @@ let rewrite_metavar_comparison_strip mvar cond =
   in
   visitor.Map_AST.vexpr cond
 
-let convert_extra x =
+(* TODO This is ugly because depends-on is inside the formula
+   but handled in Python. It might be that the only sane answer is
+   to port it to OCaml *)
+let remove_noop (e : formula_old) : formula_old =
+  let valid_formula x =
+    match x with
+    | PatFilteredInPythonTodo _ -> false
+    | _ -> true
+  in
+  let rec aux e =
+    match e with
+    | PatEither (t, xs) ->
+        let xs = Common.map aux (List.filter valid_formula xs) in
+        PatEither (t, xs)
+    | Patterns (t, xs) -> (
+        let xs' = Common.map aux (List.filter valid_formula xs) in
+        (* If the only thing in Patterns is a PatFilteredInPythonTodo key,
+           after this filter it will be an empty And. To prevent
+           an error, check for that *)
+        match (xs, xs') with
+        | [ x ], [] -> aux x
+        | _ -> Patterns (t, xs'))
+    | PatFilteredInPythonTodo t ->
+        (* If a PatFilteredInPythonTodo key is the only thing on the top
+           level, return no matches *)
+        PatEither (t, [])
+    | _ -> e
+  in
+  aux e
+
+(* return list of "positive" x list of Not *)
+let split_and : formula list -> formula list * formula list =
+ fun xs ->
+  xs
+  |> Common.partition_either (fun e ->
+         match e with
+         (* positives *)
+         | P _
+         | And _
+         | Or _ ->
+             Left e
+         (* negatives *)
+         | Not (_, f) -> Right f)
+
+let rec (convert_formula_old :
+          ?in_metavariable_pattern:bool ->
+          rule_id:rule_id ->
+          formula_old ->
+          formula) =
+ fun ?(in_metavariable_pattern = false) ~rule_id e ->
+  let rec aux e =
+    match e with
+    | Pat x -> P (x, None)
+    | PatInside x -> P (x, Some Inside)
+    | PatNot (t, x) -> Not (t, P (x, None))
+    | PatNotInside (t, x) -> Not (t, P (x, Some Inside))
+    | PatEither (t, xs) ->
+        let xs = Common.map aux xs in
+        Or (t, xs)
+    | Patterns (t, xs) ->
+        let fs, conds, focus = Common.partition_either3 aux_and xs in
+        let pos, _ = split_and fs in
+        if pos = [] && not in_metavariable_pattern then
+          raise (InvalidRule (MissingPositiveTermInAnd, rule_id, t));
+        And { tok = t; conjuncts = fs; conditions = conds; focus }
+    | PatExtra (t, _) ->
+        raise
+          (InvalidYaml
+             ("metavariable conditions must be inside a 'patterns:'", t))
+    | PatFocus (t, _) ->
+        raise
+          (InvalidYaml ("'focus-metavariable:' must be inside a 'patterns:'", t))
+    | PatFilteredInPythonTodo t -> raise (InvalidYaml ("Unexpected key", t))
+  and aux_and e =
+    match e with
+    | PatExtra (t, x) ->
+        let e = convert_extra ~rule_id x in
+        Middle3 (t, e)
+    | PatFocus (t, mvar) -> Right3 (t, mvar)
+    | _ -> Left3 (aux e)
+  in
+  aux (remove_noop e)
+
+and convert_extra ~rule_id x =
   match x with
-  | MetavarRegexp (mvar, re) -> CondRegexp (mvar, re)
-  | MetavarPattern (mvar, opt_xlang, formula) ->
+  | MetavarRegexp (mvar, re, const_prop) -> CondRegexp (mvar, re, const_prop)
+  | MetavarPattern (mvar, opt_xlang, formula_old) ->
+      let formula =
+        convert_formula_old ~in_metavariable_pattern:true ~rule_id formula_old
+      in
       CondNestedFormula (mvar, opt_xlang, formula)
   | MetavarComparison comp -> (
       match comp with
@@ -384,40 +500,8 @@ let convert_extra x =
             | Some true -> rewrite_metavar_comparison_strip mvar comparison
           in
           CondEval cond)
-  | PatWherePython _ ->
-      (*
-  logger#debug "convert_extra: %s" s;
-  Parse_rule.parse_metavar_cond s
-*)
-      failwith (Common.spf "convert_extra: TODO: %s" (show_extra x))
+  | MetavarAnalysis (mvar, kind) -> CondAnalysis (mvar, kind)
 
-let (convert_formula_old : formula_old -> formula) =
- fun e ->
-  let rec aux e =
-    match e with
-    | Pat x -> Leaf (P (x, None))
-    | PatInside x -> Leaf (P (x, Some Inside))
-    | PatNot (t, x) -> Not (t, Leaf (P (x, None)))
-    | PatNotInside (t, x) -> Not (t, Leaf (P (x, Some Inside)))
-    | PatEither (t, xs) ->
-        let xs = List.map aux xs in
-        Or (t, xs)
-    | Patterns (t, xs) ->
-        let xs = List.map aux xs in
-        And (t, xs)
-    | PatExtra (t, x) ->
-        let e = convert_extra x in
-        Leaf (MetavarCond (t, e))
-  in
-  aux e
-
-let formula_of_pformula = function
+let formula_of_pformula ?in_metavariable_pattern ~rule_id = function
   | New f -> f
-  | Old oldf -> convert_formula_old oldf
-
-let partition_rules rules =
-  rules
-  |> Common.partition_either (fun r ->
-         match r.mode with
-         | Search f -> Left (r, f)
-         | Taint s -> Right (r, s))
+  | Old oldf -> convert_formula_old ?in_metavariable_pattern ~rule_id oldf

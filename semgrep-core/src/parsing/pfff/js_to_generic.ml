@@ -17,6 +17,8 @@ open Ast_js
 module G = AST_generic
 module H = AST_generic_helpers
 
+let logger = Logging.get_logger [ __MODULE__ ]
+
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
@@ -29,17 +31,11 @@ module H = AST_generic_helpers
 (* Helpers *)
 (*****************************************************************************)
 let id x = x
-
-let option = Common.map_opt
-
+let option = Option.map
 let list = List.map
-
 let bool = id
-
 let string = id
-
 let error = AST_generic.error
-
 let fb = G.fake_bracket
 
 (* for the require -> import translation *)
@@ -59,41 +55,37 @@ let wrap _of_a (v1, v2) =
   (v1, v2)
 
 let bracket of_a (t1, x, t2) = (info t1, of_a x, info t2)
-
 let name v = wrap id v
-
 let ident x = name x
-
 let filename v = wrap string v
-
 let label v = wrap string v
 
 type special_result =
   | SR_Special of G.special wrap
-  | SR_Other of G.other_expr_operator wrap
+  | SR_Other of G.todo_kind
   | SR_Literal of G.literal
   | SR_NeedArgs of (G.expr list -> G.expr_kind)
 
 let special (x, tok) =
+  let other_expr s = SR_Other (s, tok) in
   match x with
-  | UseStrict -> SR_Other (G.OE_UseStrict, tok)
+  | UseStrict -> other_expr "UseStrict"
   | Null -> SR_Literal (G.Null tok)
   | Undefined -> SR_Literal (G.Undefined tok)
   | This -> SR_Special (G.This, tok)
   | Super -> SR_Special (G.Super, tok)
-  | Require -> SR_Other (G.OE_Require, tok) (* TODO: left up to include? *)
-  | Exports -> SR_Other (G.OE_Exports, tok)
-  | Module -> SR_Other (G.OE_Module, tok)
-  | Define -> SR_Other (G.OE_Define, tok)
-  | Arguments -> SR_Other (G.OE_Arguments, tok)
-  | New -> SR_Special (G.New, tok)
-  | NewTarget -> SR_Other (G.OE_NewTarget, tok)
+  | Require -> other_expr "Require"
+  | Exports -> other_expr "Exports"
+  | Module -> other_expr "Module"
+  | Define -> other_expr "Define"
+  | Arguments -> other_expr "Arguments"
+  | NewTarget -> other_expr "NewTarget"
   | Eval -> SR_Special (G.Eval, tok)
   | Seq -> SR_NeedArgs (fun args -> G.Seq args)
   | Typeof -> SR_Special (G.Typeof, tok)
   | Instanceof -> SR_Special (G.Instanceof, tok)
   | In -> SR_Special (G.Op G.In, tok)
-  | Delete -> SR_Other (G.OE_Delete, tok)
+  | Delete -> other_expr "Delete"
   (* a kind of cast operator:
    * See https://stackoverflow.com/questions/7452341/what-does-void-0-mean
    *)
@@ -102,7 +94,7 @@ let special (x, tok) =
         (fun args ->
           match args with
           | [ e ] ->
-              let tvoid = G.TyBuiltin ("void", tok) |> G.t in
+              let tvoid = G.ty_builtin ("void", tok) in
               G.Cast (tvoid, PI.fake_info tok ":", e)
           | _ -> error tok "Impossible: Too many arguments to Void")
   | Spread -> SR_Special (G.Spread, tok)
@@ -113,7 +105,7 @@ let special (x, tok) =
           | [] -> G.Yield (tok, None, false)
           | [ e ] -> G.Yield (tok, Some e, false)
           | _ -> error tok "Impossible: Too many arguments to Yield")
-  | YieldStar -> SR_Other (G.OE_YieldStar, tok)
+  | YieldStar -> other_expr "YieldStar"
   | Await ->
       SR_NeedArgs
         (fun args ->
@@ -242,7 +234,7 @@ and expr (x : expr) =
       G.Cast (v3, v2, v1)
   | ExprTodo (v1, v2) ->
       let v2 = list expr v2 in
-      G.OtherExpr (G.OE_Todo, G.TodoK v1 :: (v2 |> List.map (fun e -> G.E e)))
+      G.OtherExpr (v1, v2 |> List.map (fun e -> G.E e))
   | L x -> G.L (literal x)
   | Id v1 ->
       let v1 = name v1 in
@@ -254,7 +246,7 @@ and expr (x : expr) =
       | SR_NeedArgs _ ->
           error (snd v1) "Impossible: should have been matched in Call first"
       | SR_Literal l -> G.L l
-      | SR_Other (x, tok) -> G.OtherExpr (x, [ G.Tk tok ]))
+      | SR_Other categ -> G.OtherExpr (categ, []))
   | Assign (v1, tok, v2) ->
       let v1 = expr v1 and v2 = expr v2 in
       let tok = info tok in
@@ -283,8 +275,8 @@ and expr (x : expr) =
       let v2 = property_name v2 in
       let t = info t in
       match v2 with
-      | Left n -> G.DotAccess (v1, t, G.EN (G.Id (n, G.empty_id_info ())))
-      | Right e -> G.DotAccess (v1, t, G.EDynamic e))
+      | Left n -> G.DotAccess (v1, t, G.FN (G.Id (n, G.empty_id_info ())))
+      | Right e -> G.DotAccess (v1, t, G.FDynamic e))
   | Fun (v1, _v2TODO) ->
       let def, _more_attrs = fun_ v1 in
       (* todo? assert more_attrs = []? *)
@@ -294,17 +286,25 @@ and expr (x : expr) =
       let v2 = bracket (list expr) v2 in
       match x with
       | SR_Special v ->
-          G.Call (G.IdSpecial v |> G.e, bracket (List.map (fun e -> G.Arg e)) v2)
-      | SR_Literal _ -> error (snd v1) "Weird: literal in call position"
-      | SR_Other (x, tok) ->
+          G.Call (G.IdSpecial v |> G.e, bracket (List.map G.arg) v2)
+      | SR_Literal l ->
+          logger#info "Weird: literal in call position";
+          (* apparently there's code like (null)("fs"), no idea what that is *)
+          G.Call (G.L l |> G.e, bracket (List.map G.arg) v2)
+      | SR_NeedArgs f -> f (G.unbracket v2)
+      | SR_Other categ ->
           (* ex: NewTarget *)
           G.Call
-            ( G.OtherExpr (x, [ G.Tk tok ]) |> G.e,
-              bracket (List.map (fun e -> G.Arg e)) v2 )
-      | SR_NeedArgs f -> f (G.unbracket v2))
+            ( G.OtherExpr (categ, []) |> G.e,
+              bracket (List.map (fun e -> G.Arg e)) v2 ))
   | Apply (v1, v2) ->
       let v1 = expr v1 and v2 = bracket (list expr) v2 in
       G.Call (v1, bracket (List.map (fun e -> G.Arg e)) v2)
+  | New (tok, e, args) ->
+      let tok = info tok in
+      let e = expr e in
+      let args = bracket (list (fun arg -> G.Arg (expr arg))) args in
+      G.New (tok, H.expr_to_type e, args)
   | Arr v1 ->
       let v1 = bracket (list expr) v1 in
       G.Container (G.Array, v1)
@@ -335,13 +335,13 @@ and stmt x =
       G.ExprStmt (v1, t) |> G.s
   | If (t, v1, v2, v3) ->
       let v1 = expr v1 and v2 = stmt v2 and v3 = option stmt v3 in
-      G.If (t, v1, v2, v3) |> G.s
+      G.If (t, Cond v1, v2, v3) |> G.s
   | Do (t, v1, v2) ->
       let v1 = stmt v1 and v2 = expr v2 in
       G.DoWhile (t, v1, v2) |> G.s
   | While (t, v1, v2) ->
       let v1 = expr v1 and v2 = stmt v2 in
-      G.While (t, v1, v2) |> G.s
+      G.While (t, G.Cond v1, v2) |> G.s
   | For (t, v1, v2) ->
       let v1 = for_header v1 and v2 = stmt v2 in
       G.For (t, v1, v2) |> G.s
@@ -349,7 +349,7 @@ and stmt x =
       let v0 = info v0 in
       let v1 = expr v1
       and v2 = list case v2 |> List.map (fun x -> G.CasesAndBody x) in
-      G.Switch (v0, Some v1, v2) |> G.s
+      G.Switch (v0, Some (G.Cond v1), v2) |> G.s
   | Continue (t, v1, sc) ->
       let v1 = option label v1 in
       G.Continue (t, H.opt_to_label_ident v1, sc) |> G.s
@@ -369,23 +369,23 @@ and stmt x =
       let v1 = stmt v1
       and v2 = option catch_block v2
       and v3 = option tok_and_stmt v3 in
-      G.Try (t, v1, Common.opt_to_list v2, v3) |> G.s
+      G.Try (t, v1, Option.to_list v2, v3) |> G.s
   | With (_v1, v2, v3) ->
       let e = expr v2 in
       let v3 = stmt v3 in
-      G.OtherStmtWithStmt (G.OSWS_With, Some e, v3) |> G.s
+      G.OtherStmtWithStmt (G.OSWS_With, [ G.E e ], v3) |> G.s
 
 and catch_block = function
   | BoundCatch (t, v1, v2) ->
       let v1 = H.expr_to_pattern (expr v1) and v2 = stmt v2 in
-      (t, v1, v2)
+      (t, G.CatchPattern v1, v2)
   | UnboundCatch (t, v1) ->
       let v1 =
         stmt v1
         (* bugfix: reusing 't' to avoid NoTokenLocation error when
          * a semgrep patter like catch($ERR) matches an UnboundCatch. *)
       in
-      (t, G.PatUnderscore t, v1)
+      (t, G.CatchPattern (G.PatUnderscore t), v1)
 
 and tok_and_stmt (t, v) =
   let v = stmt v in
@@ -447,46 +447,43 @@ and case = function
 (* used to be an AST_generic.type_ with no conversion needed, but now that
  * we moved AST_generic.ml out of pfff, we need the boilerplate below
  *)
-and type_ x = type_kind x |> G.t
-
-and type_kind x =
+and type_ x =
   match x with
-  | TyBuiltin id -> G.TyBuiltin (ident id)
-  | TyName xs -> G.TyN (H.name_of_ids xs)
+  | TyBuiltin id -> G.ty_builtin (ident id)
+  | TyName xs -> G.TyN (H.name_of_ids xs) |> G.t
+  (* TODO: use TyExpr now? or special TyLiteral? *)
   | TyLiteral l ->
       let l = literal l in
-      G.OtherType
-        ( G.OT_Todo,
-          [ G.TodoK ("LitType", PI.unsafe_fake_info ""); G.E (G.L l |> G.e) ] )
+      G.OtherType (("LitType", PI.unsafe_fake_info ""), [ G.E (G.L l |> G.e) ])
+      |> G.t
   | TyQuestion (tok, t) ->
       let t = type_ t in
-      G.TyQuestion (t, tok)
+      G.TyQuestion (t, tok) |> G.t
   | TyArray (t, (lt, (), rt)) ->
       let t = type_ t in
-      G.TyArray ((lt, None, rt), t)
+      G.TyArray ((lt, None, rt), t) |> G.t
   | TyTuple (lt, xs, rt) ->
       let xs = List.map tuple_type_member xs in
-      G.TyTuple (lt, xs, rt)
+      G.TyTuple (lt, xs, rt) |> G.t
   | TyFun (params, typ_opt) ->
       let params = List.map parameter_binding params in
       let rett =
         match typ_opt with
-        | None -> G.TyBuiltin ("void", PI.unsafe_fake_info "void") |> G.t
+        | None -> G.ty_builtin ("void", PI.unsafe_fake_info "void")
         | Some t -> type_ t
       in
-      G.TyFun (params, rett)
+      G.TyFun (params, rett) |> G.t
   | TyRecordAnon (lt, (), rt) ->
-      G.TyRecordAnon (PI.fake_info lt "", (lt, [], rt))
+      G.TyRecordAnon ((G.Class, PI.fake_info lt ""), (lt, [], rt)) |> G.t
   | TyOr (t1, tk, t2) ->
       let t1 = type_ t1 in
       let t2 = type_ t2 in
-      G.TyOr (t1, tk, t2)
+      G.TyOr (t1, tk, t2) |> G.t
   | TyAnd (t1, tk, t2) ->
       let t1 = type_ t1 in
       let t2 = type_ t2 in
-      G.TyAnd (t1, tk, t2)
-  | TypeTodo (categ, xs) ->
-      G.OtherType (G.OT_Todo, G.TodoK categ :: List.map any xs)
+      G.TyAnd (t1, tk, t2) |> G.t
+  | TypeTodo (categ, xs) -> G.OtherType (categ, List.map any xs) |> G.t
 
 and tuple_type_member x =
   match x with
@@ -574,7 +571,7 @@ and parameter x =
         }
       in
       match v3 with
-      | None -> G.ParamClassic pclassic
+      | None -> G.Param pclassic
       | Some tok -> G.ParamRest (tok, pclassic))
 
 and argument x = expr x
@@ -606,6 +603,7 @@ and keyword_attribute (x, tok) =
     | Readonly -> G.Const
     | Optional -> G.Optional
     | Abstract -> G.Abstract
+    | Override -> G.Override
     | NotNull -> G.NotNull),
     tok )
 
@@ -645,9 +643,14 @@ and field_classic
   match v3 with
   | Some (Fun (def, None)) ->
       let def, more_attrs = fun_ def in
-      let _kind, tok = def.G.fkind in
+      let fkind, tok = def.G.fkind in
+      let fkind =
+        match fkind with
+        | G.Function -> G.Method
+        | x -> x
+      in
       ( { ent with G.attrs = ent.G.attrs @ more_attrs },
-        G.FuncDef { def with G.fkind = (G.Method, tok) } )
+        G.FuncDef { def with G.fkind = (fkind, tok) } )
   | _ ->
       let v3 = option expr v3 in
       (ent, G.VarDef { G.vinit = v3; vtype = vt })
@@ -656,7 +659,7 @@ and property x =
   match x with
   | Field v1 ->
       let ent, def = field_classic v1 in
-      G.FieldStmt (G.DefStmt (ent, def) |> G.s)
+      G.fld (ent, def)
   | FieldColon v1 ->
       let ent, def = field_classic v1 in
       let def =
@@ -666,19 +669,22 @@ and property x =
         | G.VarDef x -> G.FieldDefColon x
         | _ -> def
       in
-      G.FieldStmt (G.DefStmt (ent, def) |> G.s)
+      G.fld (ent, def)
   | FieldSpread (t, v1) ->
       let v1 = expr v1 in
-      G.FieldSpread (t, v1)
-  | FieldEllipsis v1 -> G.FieldStmt (G.exprstmt (G.Ellipsis v1 |> G.e))
+      let spec = (G.Spread, t) in
+      let e = G.special spec [ v1 ] in
+      let st = G.exprstmt e in
+      G.F st
+  | FieldEllipsis v1 -> G.fieldEllipsis v1
   | FieldPatDefault (v1, _v2, v3) ->
       let v1 = pattern v1 in
       let v3 = expr v3 in
-      G.FieldStmt (G.exprstmt (G.LetPattern (v1, v3) |> G.e))
+      G.F (G.exprstmt (G.LetPattern (v1, v3) |> G.e))
   | FieldTodo (v1, v2) ->
       let v2 = stmt v2 in
       (* hmm, should use OtherStmtWithStmt ? *)
-      G.FieldStmt (G.OtherStmt (G.OS_Todo, [ G.TodoK v1; G.S v2 ]) |> G.s)
+      G.F (G.OtherStmt (G.OS_Todo, [ G.TodoK v1; G.S v2 ]) |> G.s)
 
 and alias v1 =
   let v1 = name v1 in
@@ -688,8 +694,8 @@ and module_directive x =
   match x with
   | ReExportNamespace (v1, _v2, _opt_alias, _v3, v4) ->
       let v4 = filename v4 in
-      G.OtherDirective (G.OI_ReExportNamespace, [ G.Tk v1; G.Str v4 ])
-  | Import (t, v1, v2, v3) ->
+      G.OtherDirective (("ReExportNamespace", v1), [ G.Str v4 ])
+  | Import (t, (v1, v2), v3) ->
       let v1 = name v1 and v2 = option alias v2 and v3 = filename v3 in
       G.ImportFrom (t, G.FileName v3, v1, v2)
   | ModuleAlias (t, v1, v2) ->
@@ -704,7 +710,7 @@ and module_directive x =
       G.ImportAs (t, G.FileName v1, None)
   | Export (t, v1) ->
       let v1 = name v1 in
-      G.OtherDirective (G.OI_Export, [ G.Tk t; G.I v1 ])
+      G.OtherDirective (("Export", t), [ G.I v1 ])
 
 and require_to_import_in_stmt_opt st =
   match st with
@@ -759,7 +765,8 @@ and require_to_import_in_stmt_opt st =
             let orig = stmt st in
             Some (ys @ [ orig ])
         | _ -> raise ComplicatedCase
-      with ComplicatedCase -> None)
+      with
+      | ComplicatedCase -> None)
   | _ -> None
 
 and list_stmt xs =

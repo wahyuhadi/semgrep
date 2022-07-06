@@ -5,28 +5,146 @@
 rules:
   - id: no-print-in-semgrep
     patterns:
-    - pattern-either:
-      - pattern: pr ...
-    - pattern-not-inside: |
-       if !Flag.debug
-       then ...
-    - pattern-not-inside: |
-       let $F ... =
-          ...
-       [@@action]
+      - pattern-either:
+          - pattern: pr ...
+      - pattern-not-inside: |
+          if !Flag.debug
+          then ...
+      - pattern-not-inside: |
+          let $F ... =
+             ...
+          [@@action]
     message: you should not print anything on stdout as it may interfere with
-     the JSON output we must return to the semgrep python wrapper.
+      the JSON output we must return to the semgrep python wrapper.
     languages: [ocaml]
     severity: ERROR
     paths:
       exclude:
-       - cli/*.ml
-       - scripts/*
-       - Test.ml
-       - Matching_report.ml
-       - Unit_*.ml
-       - Test_*.ml
+        - cli/*.ml
+        - scripts/*
+        - Test.ml
+        - Matching_report.ml
+        - Unit_*.ml
+        - Test_*.ml
+        - runner/*.ml
+        - experiments/*
+        - Check_*.ml
 
+  - id: use-pytest-mock
+    pattern: import unittest.mock
+    message: >-
+      Instead of importing unittest.mock,
+      use the pytest-mock plugin by requesting the `mocker` fixture.
+    languages: [python]
+    severity: ERROR
+    paths:
+      include:
+        - tests/
+
+  - id: use-state-for-global-settings
+    pattern: global $VAR
+    message: |
+      Instead of setting global variables,
+      keep your variables around on the semgrep.state.SemgrepState class.
+      You'll then be able to access this anywhere with:
+
+      from semgrep.state import get_state
+      $VAR = get_state().$VAR
+    languages: [python]
+    severity: ERROR
+
+  - id: not-using-our-pcre-wrappers
+    patterns:
+      - pattern-either:
+          - pattern: Pcre.regexp
+          - pattern: Pcre.pmatch
+          - pattern: Pcre.exec
+          - pattern: Pcre.exec_all
+          - pattern: Pcre.split
+    message: >-
+      You should use one of the equivalent functions in SPcre, which
+      automatically sets some flags and handles exceptions.
+    languages: [ocaml]
+    severity: ERROR
+    paths:
+      exclude:
+        - SPcre.ml
+
+  - id: no-list-map
+    pattern: List.map
+    message: >-
+      `List.map` creates O(N) stack depth, and can lead to a
+      stack overflow. Use `Common.map` instead.
+    fix: Common.map
+    languages: [ocaml]
+    severity: ERROR
+    paths:
+      include:
+        - semgrep-core/src/*
+
+  - id: use-concat-map
+    pattern-either:
+      - pattern: List.map ... |> List.flatten
+      - pattern: Common.map ... |> List.flatten
+      - pattern: List.map ... |> List.concat
+      - pattern: Common.map ... |> List.concat
+      - pattern: List.flatten ( List.map ... )
+      - pattern: List.flatten ( Common.map ... )
+      - pattern: List.concat ( List.map ... )
+      - pattern: List.concat ( Common.map ... )
+    message: >-
+      `List.concat_map` is more efficient and more readable than a `map` followed
+      by `concat`.
+    languages: [ocaml]
+    severity: ERROR
+    paths:
+      include:
+        - semgrep-core/src/*
+
+  - id: no-exit-code-1-in-semgrep
+    pattern: sys.exit(1)
+    fix: sys.exit(2)
+    message: >-
+      Exit code 1 is reserved for notifying users that blocking findings were found.
+      Please use a different exit code, or better yet, a SemgrepError exception.
+      For generic fatal errors, we use exit code 2.
+    languages: [python]
+    severity: ERROR
+    paths:
+      include:
+        - cli/*
+
+  - id: no-env-vars-on-top-level
+    patterns:
+      - pattern-either:
+          - pattern: os.getenv
+          - pattern: os.environ
+      - pattern-not-inside: "def $F(...): ..."
+    message: >-
+      If you access environment variables on the top level of a module,
+      it'll be near impossible to mock the value of that variable in tests.
+
+      Please make sure to only access environment variables in functions,
+      preferably in semgrep.env.Env
+    languages: [python]
+    severity: ERROR
+    paths:
+      include:
+        - cli/src/*
+
+  - id: use-git-check-output-helper
+    pattern-either:
+      - pattern: subprocess.$METHOD(["git", ...], ...)
+      - pattern: semgrep.util.sub_check_output(["git", ...], ...)
+    message: >-
+      We have a helper function git_check_output in meta.py that
+      handles printing nice error+debug messages on failure. Use
+      that instead of using subprocess
+    languages: [python]
+    severity: ERROR
+    paths:
+      include:
+        - cli/src/*
 # not ready yet
 #  - id: no-exit-in-semgrep
 #    pattern: |

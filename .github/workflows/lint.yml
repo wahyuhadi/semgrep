@@ -2,21 +2,38 @@ name: lint
 on:
   workflow_dispatch:
   pull_request:
+  push:
+    branches:
+      - develop
 
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-      - uses: pre-commit/action@v2.0.3
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: .github/workflows/lint.yml
+      - uses: pre-commit/action@v3.0.0
 
   pre-commit-manual:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-      - uses: pre-commit/action@v2.0.3
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: .github/workflows/lint.yml
+      - uses: pre-commit/action@v3.0.0
         with:
           extra_args: --hook-stage manual
 
@@ -24,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     # Custom image provides 'ocamlformat' with a specific version needed to check
     # ocaml code (must be the same than the one in semgrep-core/dev/dev.opam)
-    container: returntocorp/ocaml:ubuntu
+    container: returntocorp/ocaml:ubuntu-2022-06-09
     steps:
       - name: Pre-checkout fixes
         run: |
@@ -32,9 +49,15 @@ jobs:
           github_cache_dir="/__w"
           sudo mkdir -p "$github_cache_dir"
           sudo chmod -R 777 "$github_cache_dir"
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Check OCaml code
-        run: sudo -u user opam exec -- pre-commit run --verbose --all lint-ocaml
+        run: |
+          sudo -u user git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # install correct version of ocamlformat
+          sudo -u user opam install -y ocamlformat.0.21.0
+          sudo -u user opam exec -- pre-commit run --verbose --all lint-ocaml
 
   changelog-reminder:
     name: Changelog Reminder
@@ -42,21 +65,25 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - id: semgrep_diff
         name: Get semgrep package diff
-        uses: technote-space/get-diff-action@v4.0.1
+        uses: technote-space/get-diff-action@v6.1.0
         with:
-          PATTERNS: semgrep/semgrep/**
+          GET_FILE_DIFF: true
+          PATTERNS: cli/src/semgrep/**
       - id: changelog_diff
         name: Get changelog diff
-        uses: technote-space/get-diff-action@v4.0.1
+        uses: technote-space/get-diff-action@v6.1.0
         with:
+          GET_FILE_DIFF: true
           FILES: CHANGELOG.md
 
       - name: Send reminder
-        uses: unsplash/comment-on-pr@v1.2.0
+        uses: unsplash/comment-on-pr@v1.3.1
         if: >
           steps.semgrep_diff.outputs.insertions > 20
           && steps.changelog_diff.outputs.insertions == 0

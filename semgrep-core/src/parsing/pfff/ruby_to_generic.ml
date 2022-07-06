@@ -36,21 +36,13 @@ module PI = Parse_info
 (* Helpers *)
 (*****************************************************************************)
 let id x = x
-
-let option = Common.map_opt
-
+let option = Option.map
 let list = List.map
-
 let bool = id
-
 let string = id
-
 let fake tok s = Parse_info.fake_info tok s
-
 let unsafe_fake s = Parse_info.unsafe_fake_info s
-
 let fb = G.fake_bracket
-
 let nonbasic_entity id_or_e = { G.name = id_or_e; attrs = []; tparams = [] }
 
 (*****************************************************************************)
@@ -58,7 +50,6 @@ let nonbasic_entity id_or_e = { G.name = id_or_e; attrs = []; tparams = [] }
 (*****************************************************************************)
 
 let info x = x
-
 let tok v = info v
 
 let wrap _of_a (v1, v2) =
@@ -66,7 +57,6 @@ let wrap _of_a (v1, v2) =
   (v1, v2)
 
 let bracket of_a (t1, x, t2) = (info t1, of_a x, info t2)
-
 let ident x = wrap string x
 
 let rec expr e =
@@ -80,7 +70,7 @@ let rec expr e =
       | _ -> G.N (G.Id (ident id, G.empty_id_info ())))
   | ScopedId x ->
       let name = scope_resolution x in
-      G.N (G.IdQualified (name, G.empty_id_info ()))
+      G.N name
   | Hash (_bool, xs) -> G.Container (G.Dict, bracket (list expr) xs)
   | Array (l, xs, r) ->
       let xs = args_to_exprs xs in
@@ -98,22 +88,33 @@ let rec expr e =
       let e2 = expr e2 in
       let e3 = expr e3 in
       G.Conditional (e1, e2, e3)
-  | Call (e, xs, bopt) ->
+  | Call (e, xs, bopt) -> (
       let e = expr e in
       let lb, xs, rb = bracket (list argument) xs in
-      (* TODO: maybe make an extra separate Call for the block? *)
-      let last = option expr bopt |> Common.opt_to_list in
-      G.Call (e, (lb, xs @ (last |> List.map G.arg), rb))
-  | DotAccess (e, t, m) ->
+      let e_call = G.Call (e, (lb, xs, rb)) in
+      match bopt with
+      | None -> e_call
+      | Some b ->
+          (* There is a block to pass to `e`. We add an extra `Call` so that
+           * `f(x) { |n| puts n }` is translated as `f(x)({ |n| puts n })`
+           * rather than as `f(x, { |n| puts n })`. This way the pattern
+           * `f(...)` will only match `f(x)` and not the entire block,
+           * and `f($X)` will match `f(x)`. *)
+          let barg = b |> expr |> G.arg in
+          G.Call (G.e e_call, (lb, [ barg ], rb)))
+  | DotAccess (e, t, m) -> (
       let e = expr e in
-      let fld =
-        match method_name m with
-        | Left id -> G.EN (G.Id (id, G.empty_id_info ()))
-        | Right e -> G.EDynamic e
-      in
-      G.DotAccess (e, t, fld)
+      match m with
+      | MethodEllipsis t -> G.DotAccessEllipsis (e, t)
+      | _ ->
+          let fld =
+            match method_name m with
+            | Left id -> G.FN (G.Id (id, G.empty_id_info ()))
+            | Right e -> G.FDynamic e
+          in
+          G.DotAccess (e, t, fld))
   | Splat (t, eopt) ->
-      let xs = option expr eopt |> Common.opt_to_list |> List.map G.arg in
+      let xs = option expr eopt |> Option.to_list |> List.map G.arg in
       let special = G.IdSpecial (G.Spread, t) |> G.e in
       G.Call (special, fb xs)
   | CodeBlock ((t1, _, t2), params_opt, xs) ->
@@ -130,6 +131,23 @@ let rec expr e =
           frettype = None;
           fbody = G.FBStmt st;
           fkind = (G.LambdaKind, t1);
+        }
+      in
+      G.Lambda def
+  | Lambda (tok, params_opt, xs) ->
+      let params =
+        match params_opt with
+        | None -> []
+        | Some xs -> xs
+      in
+      let params = list formal_param params in
+      let st = G.Block (tok, list_stmts xs, tok) |> G.s in
+      let def =
+        {
+          G.fparams = params;
+          frettype = None;
+          fbody = G.FBStmt st;
+          fkind = (G.LambdaKind, tok);
         }
       in
       G.Lambda def
@@ -155,6 +173,10 @@ let rec expr e =
 
 and argument arg : G.argument =
   match arg with
+  (* sgrep: equivalence between different keyword argument syntax *)
+  | Arg (Binop (Atom (_tk, AtomSimple id), (Op_ASSOC, _v2), v3)) ->
+      let e3 = expr v3 in
+      G.ArgKwd (id, e3)
   | Arg e -> G.Arg (expr e)
   | ArgKwd (id, _tk, arg) ->
       let id = ident id in
@@ -162,10 +184,10 @@ and argument arg : G.argument =
       G.ArgKwd (id, arg)
 
 and formal_param = function
-  | Formal_id id -> G.ParamClassic (G.param_of_id id)
+  | Formal_id id -> G.Param (G.param_of_id id)
   | Formal_amp (t, id) ->
-      let param = G.ParamClassic (G.param_of_id id) in
-      G.OtherParam (G.OPO_Ref, [ G.Tk t; G.Pa param ])
+      let param = G.Param (G.param_of_id id) in
+      G.OtherParam (("Ref", t), [ G.Pa param ])
   | Formal_star (t, id) -> G.ParamRest (t, G.param_of_id id)
   | Formal_rest t ->
       let p =
@@ -195,7 +217,7 @@ and formal_param = function
   | Formal_default (id, _t, e) ->
       let e = expr e in
       let p = { (G.param_of_id id) with G.pdefault = Some e } in
-      G.ParamClassic p
+      G.Param p
   (* TODO? diff with Formal_default? *)
   | Formal_kwd (id, _t, eopt) ->
       let eopt = option expr eopt in
@@ -204,7 +226,7 @@ and formal_param = function
         | None -> G.param_of_id id
         | Some e -> { (G.param_of_id id) with G.pdefault = Some e }
       in
-      G.ParamClassic p
+      G.Param p
   | Formal_tuple (_t1, xs, _t2) ->
       let xs = list formal_param_pattern xs in
       let pat = G.PatTuple (G.fake_bracket xs) in
@@ -221,12 +243,17 @@ and formal_param_pattern = function
       let x = formal_param x in
       G.OtherPat (("ParamPattern", PI.unsafe_fake_info ""), [ G.Pa x ])
 
-(* less: return a G.name *)
-and scope_resolution = function
+and scope_resolution x : G.name =
+  match x with
   | TopScope (t, v) ->
       let id = variable v in
-      let qualif = G.QTop t in
-      (id, { G.name_qualifier = Some qualif; name_typeargs = None })
+      IdQualified
+        {
+          G.name_last = (id, None);
+          name_middle = None;
+          name_top = Some t;
+          name_info = G.empty_id_info ();
+        }
   | Scope (e, t, v_or_m) ->
       let id = variable_or_method_name v_or_m in
       (* TODO: use an 'expr_for_scope' instead of 'expr' below, because
@@ -234,8 +261,31 @@ and scope_resolution = function
        * in which case we could generate a QDots instead of a QEXpr
        *)
       let e = expr e in
-      let qualif = G.QExpr (e, t) in
-      (id, { G.name_qualifier = Some qualif; name_typeargs = None })
+      let qualif =
+        match e with
+        | { G.e = G.N (G.Id (id, _info)); _ } -> G.QDots [ (id, None) ]
+        | {
+         G.e =
+           G.N
+             (G.IdQualified
+               {
+                 name_last;
+                 name_middle = Some (G.QDots middle);
+                 name_top = None;
+                 _;
+               });
+         _;
+        } ->
+            G.QDots (middle @ [ name_last ])
+        | _ -> G.QExpr (e, t)
+      in
+      IdQualified
+        {
+          G.name_last = (id, None);
+          name_middle = Some qualif;
+          name_top = None;
+          name_info = G.empty_id_info ();
+        }
 
 and variable (id, _kind) = ident id
 
@@ -246,7 +296,7 @@ and variable_or_method_name = function
       | Left id -> id
       | Right _ -> failwith "TODO: variable_or_method_name")
 
-and method_name mn =
+and method_name (mn : method_name) : (G.ident, G.expr) Common.either =
   match mn with
   | MethodId v -> Left (variable v)
   | MethodIdAssign (id, teq, id_kind) ->
@@ -268,6 +318,8 @@ and method_name mn =
               let t = PI.combine_infos l [ t2; r ] in
               Left (s, t)
           | _ -> Right (string_contents_list (l, xs, r) |> G.e)))
+  (* sgrep-ext: this should be covered in the caller *)
+  | MethodEllipsis t -> raise (Parse_info.Parsing_error t)
 
 and string_contents_list (t1, xs, t2) : G.expr_kind =
   let xs = list (string_contents t1) xs in
@@ -398,14 +450,42 @@ and literal x =
           G.L (G.String (s, t))
       (* TODO: generate interpolation Special *)
       | Double xs -> string_contents_list xs
-      | Tick xs ->
-          G.OtherExpr (G.OE_Subshell, [ G.E (string_contents_list xs |> G.e) ]))
-  | Regexp ((l, xs, r), opt) -> (
-      match xs with
-      | [ StrChars (s, t) ] -> G.L (G.Regexp ((l, (s, t), r), opt))
-      | _ ->
-          (* TODO *)
-          string_contents_list (l, xs, r))
+      | Tick (l, xs, r) ->
+          G.OtherExpr
+            (("Subshell", l), [ G.E (string_contents_list (l, xs, r) |> G.e) ]))
+  | Regexp ((l, xs, r), opt) ->
+      let rec f strs toks = function
+        | [ StrChars (s, t) ] ->
+            let str = String.concat "" (s :: strs) in
+            let tok = PI.combine_infos t toks in
+            G.L (G.Regexp ((l, (str, tok), r), opt))
+        | StrChars (s, t) :: tl -> f (s :: strs) (t :: toks) tl
+        | StrExpr _ :: _
+        | [] ->
+            (* TODO *)
+            string_contents_list (l, xs, r)
+      in
+      f [] [] (List.rev xs)
+
+and expr_special_cases e =
+  (* Code parsed as expressions in Ruby that we want to represent
+     in some other way *)
+  match e.G.e with
+  (* Function calls like `require $X` are really directives *)
+  | G.Call ({ G.e = G.N (G.Id (("require_relative", t), _)); _ }, args)
+  | G.Call ({ G.e = G.N (G.Id (("require", t), _)); _ }, args)
+  | G.Call ({ G.e = G.N (G.Id (("load", t), _)); _ }, args) -> (
+      match args with
+      | _, [ G.Arg { G.e = G.L (G.String str); _ } ], _
+      | _, [ G.Arg { G.e = G.N (G.Id (str, _)); _ } ], _ ->
+          let s =
+            G.DirectiveStmt
+              { G.d = G.ImportAll (t, G.FileName str, t); G.d_attrs = [] }
+            |> G.s
+          in
+          G.S s
+      | _ -> G.E e)
+  | _ -> G.E e
 
 and expr_as_stmt = function
   | S x -> stmt x
@@ -413,15 +493,19 @@ and expr_as_stmt = function
   | e -> (
       let e = expr e in
       match e.G.e with
-      (* a single name on its own line is probably an hidden fun call,
-       * unless it's a metavariable
-       *)
+      (* targets only: a single name on its own line is probably an hidden fun call,
+         * unless it's a metavariable
+      *)
       | G.N (G.Id ((s, _), _)) ->
           if AST_generic_.is_metavar_name s then G.exprstmt e
           else
             let call = G.Call (e, fb []) |> G.e in
             G.exprstmt call
-      | _ -> G.exprstmt e)
+      | _ -> (
+          match expr_special_cases e with
+          | G.S s -> s
+          | G.E e -> G.exprstmt e
+          | _ -> raise Impossible))
 
 and stmt st =
   match st with
@@ -432,17 +516,17 @@ and stmt st =
       let e = expr e in
       let st = list_stmt1 st in
       let elseopt = option_tok_stmts elseopt in
-      G.If (t, e, st, elseopt) |> G.s
+      G.If (t, G.Cond e, st, elseopt) |> G.s
   | While (t, _bool, e, st) ->
       let e = expr e in
       let st = list_stmt1 st in
-      G.While (t, e, st) |> G.s
+      G.While (t, G.Cond e, st) |> G.s
   | Until (t, _bool, e, st) ->
       let e = expr e in
       let special = G.IdSpecial (G.Op G.Not, t) |> G.e in
       let e = G.Call (special, fb [ G.Arg e ]) |> G.e in
       let st = list_stmt1 st in
-      G.While (t, e, st) |> G.s
+      G.While (t, G.Cond e, st) |> G.s
   | Unless (t, e, st, elseopt) ->
       let e = expr e in
       let st = list_stmt1 st in
@@ -454,7 +538,7 @@ and stmt st =
         | None -> G.Block (fb []) |> G.s
         | Some st -> st
       in
-      G.If (t, e, st1, Some st) |> G.s
+      G.If (t, G.Cond e, st1, Some st) |> G.s
   | For (t1, pat, t2, e, st) ->
       let pat = pattern pat in
       let e = expr e in
@@ -489,7 +573,13 @@ and stmt st =
             let st = list_stmt1 sts in
             [ ([ G.Default t ], st) ]
       in
-      G.Switch (t, eopt, whens @ default |> List.map (fun x -> G.CasesAndBody x))
+      let condopt =
+        match eopt with
+        | None -> None
+        | Some e -> Some (G.Cond e)
+      in
+      G.Switch
+        (t, condopt, whens @ default |> List.map (fun x -> G.CasesAndBody x))
       |> G.s
   | ExnBlock b -> body_exn b
 
@@ -575,8 +665,7 @@ and definition def =
             match name with
             | NameConstant id -> G.basic_entity id
             | NameScope x ->
-                let name_ = scope_resolution x in
-                let name = G.IdQualified (name_, G.empty_id_info ()) in
+                let name = scope_resolution x in
                 nonbasic_entity (G.EN name)
           in
           let def =
@@ -587,7 +676,7 @@ and definition def =
               cimplements = [];
               cmixins = [];
               cparams = [];
-              cbody = fb [ G.FieldStmt body ];
+              cbody = fb [ G.F body ];
             }
           in
           G.DefStmt (ent, G.ClassDef def) |> G.s
@@ -600,8 +689,7 @@ and definition def =
         match name with
         | NameConstant id -> G.basic_entity id
         | NameScope x ->
-            let name_ = scope_resolution x in
-            let name = G.IdQualified (name_, G.empty_id_info ()) in
+            let name = scope_resolution x in
             nonbasic_entity (G.EN name)
       in
       let mkind = G.ModuleStruct (None, [ body ]) in
@@ -610,21 +698,24 @@ and definition def =
   | BeginBlock (_t, (t1, st, t2)) ->
       let st = list_stmts st in
       let st = G.Block (t1, st, t2) |> G.s in
-      G.OtherStmtWithStmt (G.OSWS_BEGIN, None, st) |> G.s
+      G.OtherStmtWithStmt (G.OSWS_BEGIN, [], st) |> G.s
   | EndBlock (_t, (t1, st, t2)) ->
       let st = list_stmts st in
       let st = G.Block (t1, st, t2) |> G.s in
-      G.OtherStmtWithStmt (G.OSWS_END, None, st) |> G.s
+      G.OtherStmtWithStmt (G.OSWS_END, [], st) |> G.s
   | Alias (t, mn1, mn2) ->
-      let mn1 = method_name_to_any mn1 in
-      let mn2 = method_name_to_any mn2 in
-      G.DirectiveStmt
-        (G.OtherDirective (G.OI_Alias, [ G.Tk t; mn1; mn2 ]) |> G.d)
-      |> G.s
+      let mn1 = method_name mn1 in
+      let name_or_dyn =
+        match mn1 with
+        | Left id -> G.EN (G.Id (id, G.empty_id_info ()))
+        | Right e -> G.EDynamic e
+      in
+      let ent = { G.name = name_or_dyn; attrs = []; tparams = [] } in
+      let def = G.OtherDef (("Alias", t), [ method_name_to_any mn2 ]) in
+      G.DefStmt (ent, def) |> G.s
   | Undef (t, mns) ->
       let mns = list method_name_to_any mns in
-      G.DirectiveStmt (G.OtherDirective (G.OI_Undef, G.Tk t :: mns) |> G.d)
-      |> G.s
+      G.DirectiveStmt (G.OtherDirective (("Undef", t), mns) |> G.d) |> G.s
 
 and body_exn x =
   match x with
@@ -656,28 +747,29 @@ and body_exn x =
           let st = list_stmt1 sts in
           let try_ = G.Try (fake t "try", body, catches, finally_opt) |> G.s in
           let st = G.Block (fb [ try_; st ]) |> G.s in
-          G.OtherStmtWithStmt (G.OSWS_Else_in_try, None, st) |> G.s)
+          G.OtherStmtWithStmt (G.OSWS_Else_in_try, [], st) |> G.s)
 
-and rescue_clause (t, exns, exnvaropt, sts) =
+and rescue_clause (t, exns, exnvaropt, sts) : G.catch =
   let st = list_stmt1 sts in
   let exns = list exception_ exns in
   match (exns, exnvaropt) with
-  | [], None -> (t, G.PatUnderscore t, st)
+  | [], None -> (t, G.CatchPattern (G.PatUnderscore t), st)
   | [], Some (t, lhs) ->
       let e = expr lhs in
-      (t, G.OtherPat (("Rescue", t), [ G.E e ]), st)
+      (t, G.CatchPattern (G.OtherPat (("Rescue", t), [ G.E e ])), st)
   | x :: xs, None ->
       let disjs = List.fold_left (fun e acc -> G.PatDisj (e, acc)) x xs in
-      (t, disjs, st)
+      (t, G.CatchPattern disjs, st)
   | x :: xs, Some (t, lhs) ->
       let disjs = List.fold_left (fun e acc -> G.PatDisj (e, acc)) x xs in
       let e = expr lhs in
-      (t, G.OtherPat (("RescueDisj", t), [ G.E e; G.P disjs ]), st)
+      ( t,
+        G.CatchPattern (G.OtherPat (("RescueDisj", t), [ G.E e; G.P disjs ])),
+        st )
 
-and exception_ e =
+and exception_ e : G.pattern =
   let t = type_ e in
-  (* TODO: should pass the possible id in exnvaropt above here? *)
-  G.PatVar (t, None)
+  G.OtherPat (("Exn", unsafe_fake ""), [ G.T t ])
 
 (* similar to Python_to_generic.list_stmt1 *)
 and list_stmt1 xs =
@@ -726,7 +818,7 @@ let any x =
       match x with
       | S x -> G.S (stmt x)
       | D x -> G.S (definition x)
-      | _ -> G.E (expr x))
+      | e -> expr_special_cases (expr e))
   | S2 x -> G.S (stmt x)
   | Ss xs -> G.Ss (list_stmts xs)
   | Pr xs -> G.Ss (list_stmts xs)

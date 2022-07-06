@@ -2,18 +2,21 @@
  *
  * Copyright (C) 2020 r2c
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License (GPL)
- * version 2 as published by the Free Software Foundation.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * version 2.1 as published by the Free Software Foundation, with the
+ * special exception on linking described in file license.txt.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * file license.txt for more details.
+ * This library is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
+ * license.txt for more details.
  *)
 open Common
 module PI = Parse_info
 module G = AST_generic
+
+let logger = Logging.get_logger [ __MODULE__ ]
 
 (*****************************************************************************)
 (* Prelude *)
@@ -57,12 +60,13 @@ let line_col_to_pos file =
         done;
         charpos := !charpos + String.length s + 1
       done
-    with End_of_file ->
-      (* bugfix: this is wrong:  Hashtbl.add h (!line, 0) !charpos;
-       * because an ident on the last line would get
-       * the last charpos.
-       *)
-      ()
+    with
+    | End_of_file ->
+        (* bugfix: this is wrong:  Hashtbl.add h (!line, 0) !charpos;
+         * because an ident on the last line would get
+         * the last charpos.
+         *)
+        ()
   in
   full_charpos_to_pos_aux ();
   close_in chan;
@@ -76,7 +80,8 @@ let token env (tok : Tree_sitter_run.Token.t) =
   let line = start.Tree_sitter_run.Loc.row + 1 in
   let column = start.Tree_sitter_run.Loc.column in
   let charpos =
-    try Hashtbl.find h (line, column) with Not_found -> -1
+    try Hashtbl.find h (line, column) with
+    | Not_found -> -1
     (* TODO? more strict? raise exn? *)
   in
   let file = env.file in
@@ -102,18 +107,18 @@ let str_if_wrong_content_temporary_fix env (tok : Tree_sitter_run.Token.t) =
     (* Parse_info is 1-line based and 0-column based, like Emacs *)
     let line = pos.Tree_sitter_run.Loc.row + 1 in
     let column = pos.Tree_sitter_run.Loc.column in
-    try (Hashtbl.find h (line, column), line, column)
-    with Not_found ->
-      failwith (spf "could not find line:%d x col:%d in %s" line column file)
+    try (Hashtbl.find h (line, column), line, column) with
+    | Not_found ->
+        failwith (spf "could not find line:%d x col:%d in %s" line column file)
   in
   let charpos2 =
     let pos = loc.Tree_sitter_run.Loc.end_ in
     (* Parse_info is 1-line based and 0-column based, like Emacs *)
     let line = pos.Tree_sitter_run.Loc.row + 1 in
     let column = pos.Tree_sitter_run.Loc.column in
-    try Hashtbl.find h (line, column)
-    with Not_found ->
-      failwith (spf "could not find line:%d x col:%d in %s" line column file)
+    try Hashtbl.find h (line, column) with
+    | Not_found ->
+        failwith (spf "could not find line:%d x col:%d in %s" line column file)
   in
   (* Range.t is inclusive, so we need -1 to remove the char at the pos *)
   let charpos2 = charpos2 - 1 in
@@ -144,17 +149,13 @@ let debug_sexp_cst_after_error sexp_cst =
   pr2 s
 
 let wrap_parser tree_sitter_parser ast_mapper =
-  (* Note that because we currently use Parallel.invoke to
-   * invoke the tree-sitter parser, unmarshalled exn
-   * can't be used in match or try or used for structural equality.
-   * So take care! Fortunately the ocaml-tree-sitter parsers now
-   * return a list of error instead of an exception so this is now
-   * less an issue.
-   *)
   let res : 'a Tree_sitter_run.Parsing_result.t = tree_sitter_parser () in
   let program =
     match res.program with
-    | Some cst -> Some (ast_mapper cst)
+    | Some cst ->
+        if res.errors <> [] then
+          logger#error "Partial errors returned by Tree-sitter parser";
+        Some (ast_mapper cst)
     | None -> None
   in
   { res with program }
@@ -174,7 +175,6 @@ let wrap_parser tree_sitter_parser ast_mapper =
     (Failure "not implemented") as exn ->
       H.debug_sexp_cst_after_error (CST.sexp_of_program cst);
       raise exn
-
 *)
 
 let parse_number_literal (s, t) =

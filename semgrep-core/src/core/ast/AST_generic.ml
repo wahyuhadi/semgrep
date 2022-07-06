@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2022 r2c
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -28,6 +28,12 @@
  *  - Go
  *  - JSON, YAML, HCL
  *  - OCaml, Scala, Rust
+ *  - Bash, Docker
+ *  - TODO SQL
+ *
+ * See Lang.ml for the list of supported languages.
+ * See IL.ml for a generic IL (Intermediate language) better suited for
+ * advanced static analysis (e.g., dataflow).
  *
  * rational: In the end, programming languages have a lot in Common.
  * Even though some interesting analysis are probably better done on a
@@ -56,6 +62,9 @@
  *    because this is not always possible (e.g., a,b=foo()) and people may
  *    want to explicitely match tuples assignments (we do some magic in
  *    Generic_vs_generic though to let 'a=1' matches also 'a,b=1,2').
+ *  - multiple entity imports in one declaration (e.g., from foo import {a,b})
+ *    are expanded in multiple individual imports
+ *    (in the example, from foo import a; from foo import b).
  *  - multiple ways to define a function are converted all to a
  *    'function_definition' (e.g., Javascript arrows are converted in that)
  *    update: but we now have a more precise function_body type
@@ -78,7 +87,7 @@
  * TODO? it may be time to rename this file CST_generic.ml
  *
  * todo:
- *  - add C++ (argh) and improve things for Kotlin/Scala/Rust
+ *  - improve things for Kotlin/Scala/Rust/C++/Java
  *  - see ast_fuzzy.ml todos for ideas to use AST_generic for sgrep?
  *
  * related work:
@@ -94,7 +103,7 @@
  *  - Facebook Infer SIL (for C++, Java, Objective-C)
  *  - Dawson Engler and Fraser Brown micro-checkers for multiple languages
  *  - Comby common representation by Rijnard,
- *    see "Lightweight Multi-language syntax transformation", but does not
+ *    see "Lightweight Multi-language syntax transformation", but it does not
  *    really operate on an AST
  *  - https://tabnine.com/ which supports multiple languages, but probably
  *    again does not operate on an AST
@@ -106,6 +115,7 @@
  *  - data-type a la carte like in github-semantic but IMHO too high-level
  *    with astronaut-style architecture (too abstract, too advanced features).
  *  - CURRENT SOLUTION: the OtherXxx strategy used in this file (simple)
+ *    update: actually switch to OtherXxx of todo_kind, even simpler
  *  - functorize and add some type hole (type tstmt; type texpr; ...),
  *    todo? not a bad idea if later we want to add type information on each
  *    expression nodes
@@ -119,6 +129,7 @@
  *  - all the other_xxx types should contain only simple constructors (enums)
  *    without any parameter. I rely on that to simplify the code
  *    of the generic mapper and matcher.
+ *    update: prefer todo_kind to those other_xxx types now.
  *    Same for keyword_attributes.
  *  - each expression or statement must have at least one token in it
  *    so that semgrep can track a location (e.g., 'Return of expr option'
@@ -161,9 +172,7 @@ type tok = Parse_info.t [@@deriving show]
  * related: Lib_AST.abstract_position_info_any and then use OCaml generic '='.
  *)
 let equal_tok _t1 _t2 = true
-
 let hash_tok _t = 0
-
 let hash_fold_tok acc _t = acc
 
 (* a shortcut to annotate some information with position information *)
@@ -182,7 +191,17 @@ type 'a bracket = tok * 'a * tok [@@deriving show, eq, hash]
  *)
 type sc = tok [@@deriving show, eq, hash]
 
-(* an AST element not yet handled *)
+(* an AST element not yet handled.
+ * history: I started by having some precise OtherXxx of other_xxx
+ * constructors and types to record what was not handled
+ * (e.g., OE_Delete, OE_Define, etc.), but it was quickly getting tedious
+ * each time to add new constructs. In fact, in the language-specific
+ * ASTs I started to use also some Todo constructs, so I switched to a
+ * more general todo_kind in the generic AST too. Anyway, we were
+ * not doing anything with the precise information. If something
+ * is important and require some semantic equivalence in semgrep, then
+ * we should support the construct directly, not via an other_xxx.
+ *)
 type todo_kind = string wrap [@@deriving show, eq, hash]
 
 (*****************************************************************************)
@@ -198,10 +217,15 @@ type ident = string wrap [@@deriving show, eq, hash]
 type dotted_ident = ident list (* at least 1 element *)
 [@@deriving show, eq, hash]
 
-(* module_name can also be used for a package name or a namespace *)
+(* module_name can also be used for a package name or a namespace.
+ * TODO? prefix with M and add MQualifiedName for C++?
+ * less: can even be dynamic in C with #include of expr
+ *)
 type module_name =
   | DottedName of dotted_ident (* ex: Python *)
-  (* in FileName the '/' is similar to the '.' in DottedName *)
+  (* in FileName the '/' is similar to the '.' in DottedName.
+   * In C/C++ the string can be <foo.h>.
+   *)
   | FileName of string wrap (* ex: Js import, C #include, Go import *)
 [@@deriving show { with_path = false }, eq, hash]
 
@@ -221,7 +245,6 @@ type module_name =
  *)
 (* a single unique gensym'ed number. See gensym() below *)
 type sid = int
-
 and resolved_name = resolved_name_kind * sid
 
 and resolved_name_kind =
@@ -233,8 +256,8 @@ and resolved_name_kind =
    *)
   | Global
   (* Those could be merged, but again this is useful in codemap/efuns *)
-  | Local
-  | Param
+  | LocalVar
+  | Parameter
   (* For closures; can refer to a Local or Param.
    * With sid this is potentially less useful for scoping-related issues,
    * but this can be useful in codemap to again highlight specially
@@ -259,6 +282,25 @@ and resolved_name_kind =
   (* used for C *)
   | Macro
   | EnumConstant
+  (* for deep semgrep
+   *
+   * ResolvedName (resolved_name, alternate_names)
+   *
+   * resolved_name: The canonical, global name that the symbol resolves to.
+   *
+   * alternate_names: Other names that users may write when referring to this
+   * symbol. For example, in JS, the resolved_name may include the file path of
+   * the file where the symbol is defined, but users may want to write patterns
+   * to match based on the module specifier, e.g.:
+   *
+   * import {bar} from 'foo';
+   * bar;
+   *
+   * We might store ['/path/to/node_modules/foo/src/x.js', 'bar'] as the
+   * resolved_name, but we also want to match the pattern `foo.bar` so we will
+   * store ['foo', 'bar'] as an alternate name.
+   * *)
+  | ResolvedName of dotted_ident * dotted_ident list
 [@@deriving show { with_path = false }, eq, hash]
 
 (* Start of big mutually recursive types because of the use of 'any'
@@ -284,45 +326,31 @@ and resolved_name_kind =
  * AST_generic_helpers.name_of_dot_access to convert a DotAccess of idents
  * into an IdQualified name.
  *
- * less: factorize the id_info in both and inline maybe name_info
+ * sgrep-ext: note that ident can be a metavariable.
  *)
-type name =
-  | Id of ident * id_info
-  | IdQualified of (ident * name_info) * id_info
+type name = Id of ident * id_info | IdQualified of qualified_info
 
-and name_info = {
-  name_qualifier : qualifier option;
-  name_typeargs : type_arguments option; (* Java/Rust *)
+(* A qualified (via type arguments or module/namespace/package) id.
+ * The type should be enough to represent Java/Rust/C++ generics.
+ * less: it is still not enough to represent OCaml functors applications.
+ *
+ * invariant: you can't have name_top = None, name_middle = QNone, and
+ * name_last = (id * None) at the same time. If that's the case, then we
+ * build an Id, not an Idqualified
+ *)
+and qualified_info = {
+  name_last : ident * type_arguments option;
+  name_middle : qualifier option;
+  (* ::, Ruby, C++, also '`' abuse for PolyVariant in OCaml *)
+  name_top : tok option;
+  name_info : id_info;
 }
 
-(* TODO: not enough in OCaml with functor and type args or C++ templates.
- * We will need to merge name_typeargs and name_qualifier and have a
- * qualifier list instead (with QId and QTemplateId like in ast_cpp.ml)
- *)
 and qualifier =
-  (* ::, Ruby, C++, also '`' abuse for PolyVariant in OCaml *)
-  | QTop of tok
-  (* Java, OCaml *)
-  | QDots of dotted_ident
-  (* Ruby *)
+  (* Java/C++/Rust *)
+  | QDots of (ident * type_arguments option) list
+  (* Ruby/Lua *)
   | QExpr of expr * tok
-
-(* This is used to represent field names, where sometimes the name
- * can be a dynamic expression, or more recently also to
- * represent entities like in Ruby where a class name can be dynamic.
- *)
-and name_or_dynamic =
-  (* In the case of a field, it may be hard to resolve the id_info inside name.
-   * For example, a method id can refer to many method definitions.
-   * But for certain things, like a private field, we can resolve it
-   * (right now we use an EnclosedVar for those fields).
-   *
-   * The IdQualified inside name is
-   * Useful for OCaml field access, but also for Ruby class entity name.
-   *)
-  | EN of name
-  (* for PHP/JS fields (even though JS use ArrayAccess for that), or Ruby *)
-  | EDynamic of expr
 
 (*****************************************************************************)
 (* Naming/typing *)
@@ -338,14 +366,38 @@ and id_info = {
   (* type checker (typing) *)
   (* sgrep: this is for sgrep constant propagation hack.
    * todo? associate only with Id?
-   * note that we do not use the constness for equality (hence the adhoc
-   * @equal below) because the constness analysis is now controlflow-sensitive
-   * meaning the same variable might have different id_constness value
+   * note that we do not use the svalue for equality (hence the adhoc
+   * @equal below) because the svalue analysis is now controlflow-sensitive
+   * meaning the same variable might have different id_svalue value
    * depending where it is used.
    *)
-  id_constness : constness option ref; [@equal fun _a _b -> true]
-      (* THINK: Drop option? *)
+  id_svalue : svalue option ref; [@equal fun _a _b -> true]
+  (* THINK: Drop option? *)
+  (* id_hidden=true must be set for any artificial identifier that never
+     appears in source code but is introduced in the AST after parsing.
+
+     Don't use this for syntax desugaring or transpilation because the
+     resulting function name might exist in some source code. Consider the
+     following normalization:
+
+       !foo -> foo.contents
+                   ^^^^^^^^
+                 should not be marked as hidden because it could appear
+                 in target source code.
+
+     However, an artificial identifier like "!sh_quoted_expand!" should
+     be marked as hidden in bash.
+
+     This allows not breaking the -fast/-filter_irrelevant_rules optimization
+     that skips a target file if some identifier in the pattern AST doesn't
+     exist in the source of the target.
+  *)
+  id_hidden : bool;
+  (* this is used by Naming_X in deep-semgrep *)
+  id_info_id : id_info_id; [@equal fun _a _b -> true]
 }
+
+and id_info_id = int
 
 (*****************************************************************************)
 (* Expression *)
@@ -366,7 +418,11 @@ and expr = {
 and expr_kind =
   (* basic (atomic) values *)
   | L of literal
-  (* composite values *)
+  (* composite values
+   * TODO? element list bracket, so can encode KeyVal, Designator,
+   * IndexArray for C++.
+   * ArrayInitDesignator [x] = ... use ArrayAccess in container?
+   *)
   | Container of container_operator * expr list bracket
   | Comprehension of container_operator * comprehension bracket
   (* And-type (field.vinit should be a Some) *)
@@ -391,24 +447,38 @@ and expr_kind =
    * how user think.
    *)
   | Constructor of name * expr list bracket
-  (* see also Call(IdSpecial (New,_), [ArgType _;...] for other values *)
+  (* see also New(...) for other values *)
   | N of name
-  | IdSpecial of special wrap (*e: [[AST_generic.expr]] other identifier cases *)
+  | IdSpecial of
+      special wrap (*e: [[AST_generic.expr]] other identifier cases *)
   (* operators and function application *)
   | Call of expr * arguments
+  (* 'type_' below is usually a TyN or TyArray (or TyExpr).
+   * Note that certain languages do not have a 'new' keyword
+   * (e.g., Python, Scala 3), instead certain 'Call' are really 'New'.
+   * old: this is used to be an IdSpecial used in conjunction with
+   * Call ([ArgType _; ...]) but better to be more precise here as
+   * New is really important for typing (and other program analysis).
+   * note: see also AnonClass which is also a New.
+   *)
+  | New of tok (* 'new' (can be fake) *) * type_ * arguments
   (* TODO? Separate regular Calls from OpCalls where no need bracket and Arg *)
   (* (XHP, JSX, TSX), could be transpiled also (done in IL.ml?) *)
   | Xml of xml
   (* IntepolatedString of expr list is simulated with a
    * Call(IdSpecial (Concat ...)) *)
-
   (* The left part should be an lvalue (Id, DotAccess, ArrayAccess, Deref)
    * but it can also be a pattern (Container, even Record), but
    * you should really use LetPattern for that.
-   * Assign can also be abused to declare new variables, but you should use
-   * variable_definition for that.
-   * less: should be in stmt, but most languages allow this at expr level :(
-   * todo: see IL.ml where we normalize this AST with expr/instr/stmt
+   *
+   * newvar: Assign is also sometimes abused to declare new variables
+   * (e.g., in Python/PHP), but you should prefer variable_definition if
+   * you can.
+   *
+   * less: it would be better to have Assign as a stmt, but most languages
+   * allow this at expr level :(
+   * Note that IL.ml improves the situation by normalizing this AST with
+   * separate expr/instr/stmt types.
    * update: should even be in a separate simple_stmt, as in Go
    *)
   | Assign of
@@ -422,7 +492,7 @@ and expr_kind =
    * qualifier though.
    * TODO? have a dot_operator to differentiate ., .?, and :: in Kotlin?
    *)
-  | DotAccess of expr * tok (* ., ::, ->, # *) * name_or_dynamic
+  | DotAccess of expr * tok (* ., ::, ->, #, $ *) * field_name
   (* in Js ArrayAccess is also abused to perform DotAccess (..., FDynamic) *)
   | ArrayAccess of expr * expr bracket
   (* could also use ArrayAccess with a Tuple rhs, or use a special *)
@@ -433,8 +503,10 @@ and expr_kind =
         bracket
   (* very special value. 'fbody' is usually an FExpr. *)
   | Lambda of function_definition
-  (* also a special value. Usually an argument of a New
-   * (used in Java, Javascript, etc.) *)
+  (* also a special value; usually an argument of a New
+   * (used in Java/Javascript/Scala/...)
+   * TODO: rename as NewAnonClass and add the token for 'new'
+   *)
   | AnonClass of class_definition
   (* a.k.a ternary expression. Note that even in languages like OCaml
    * where 'if's are expressions, we still prefer to use the stmt 'If'
@@ -451,18 +523,48 @@ and expr_kind =
   | Seq of expr list (* at least 2 elements *)
   (* less: could be in Special, but pretty important so I've lifted them here*)
   | Ref of tok (* &, address of *) * expr
-  | DeRef of tok (* '*' in C, '!' or '<-' in OCaml, ^ in Reason *) * expr (*e: [[AST_generic.expr]] other cases *)
+  | DeRef of tok (* '*' in C, '!' or '<-' in OCaml, ^ in Reason *) * expr
+  (* For YAML aliases
+     TODO a better solution would be to use symbolic propagation
+     This is a little tricky because YAML is a highly nested expression
+     and anchors can be nested. We can get around this by extracting
+     the aliases as VarDefs in the beginning and then using them later.
+     Revisit when symbolic propagation is more stable
+  *)
+  | Alias of string wrap * expr
+  (* In some rare cases, we need to keep the parenthesis around an expression
+   * otherwise in autofix semgrep could produce incorrect code. For example,
+   * in Go a cast int(3.0) requires the parenthesis.
+   * alt: change cast to take a expr bracket, but this is used only for Go.
+   * Note that this data structure is really becoming more a CST than an AST.
+   *)
+  | ParenExpr of expr bracket
   (* sgrep: ... in expressions, args, stmts, items, and fields
    * (and unfortunately also in types in Python) *)
   | Ellipsis of tok (* '...' *)
   | DeepEllipsis of expr bracket (* <... ...> *)
   | DisjExpr of expr * expr
   | TypedMetavar of ident * tok (* : *) * type_
-  (* for ellipsis in method chaining *)
+  (* for ellipsis in method chaining.
+   * alt: make it part of field_name in DotAccess
+   *)
   | DotAccessEllipsis of expr * tok (* '...' *)
-  (* TODO: other_expr_operator wrap, so enforce at least one token instead
-   * of relying that the any list contains at least one token *)
-  | OtherExpr of other_expr_operator * any list
+  (* Dual of ExprStmt. See stmt_to_expr() below and its comment.
+   * OCaml/Ruby/Scala/... have just expressions, not separate statements.
+   *)
+  | StmtExpr of stmt
+  (* e.g., TypeId in C++, MethodRef/ClassLiteral in Java, Send/Receive in Go,
+   * Checked/Unchecked in C#, Repr in Python, RecordWith in OCaml/C#,
+   * Subshell in Ruby, Delete/Unset in JS/Hack/Solidity/C++,
+   * Unpack/ArrayAppend in PHP (the AST for $x[] = 1 used to be
+   * handled as an AssignOp with special Append).
+   * Define/Arguments/NewTarget/YieldStar/Exports/Module/Require/UseStrict JS,
+   * UnitLiteral/HexString/UnicodeString/TupleHole/StructExpr in Solidity
+   * TODO? lift up to program attribute/directive UseStrict, Require in Import?
+   * TODO? of replace 'any list' by 'expr list'? any way there's still
+   * StmtExpr above to wrap stmt if it's not an expr but a stmt
+   *)
+  | OtherExpr of todo_kind * any list
 
 and literal =
   | Bool of bool wrap
@@ -473,7 +575,21 @@ and literal =
   | Int of int option wrap
   | Float of float option wrap
   | Char of string wrap
-  | String of string wrap (* TODO? bracket, ', ", or even """ *)
+  (* String literals:
+     The token includes the quotes (if any) but the string value excludes them.
+     The value is the escaped string content. For example,
+     The escaped content of the Python string literal '\\(\\)' is \\(\\).
+     The unescaped content would be \(\).
+     TODO: use bracket instead of wrap, ', ", or even """
+     TODO: expose the unescaped contents if known, so that we could analyze
+     string contents correctly.
+     An incremental change could be:
+
+     | String of (string * string option) bracket
+                  ^^^^^^   ^^^^^^
+                  escaped  unescaped
+  *)
+  | String of string wrap
   | Regexp of string wrap bracket (* // *) * string wrap option (* modifiers *)
   | Atom of tok (* ':' in Ruby, ''' in Scala *) * string wrap
   | Unit of tok
@@ -487,8 +603,13 @@ and literal =
 (* The type of an unknown constant. *)
 and const_type = Cbool | Cint | Cstr | Cany
 
-(* set by the constant propagation algorithm and used in semgrep *)
-and constness = Lit of literal | Cst of const_type | NotCst
+(* semantic value: set by the svalue propagation algorithm and used in semgrep
+ *
+ * Note that we can't track a constant and a symbolic expression at the same
+ * time. If this becomes a problem then we may want to have separate analyses
+ * for constant and symbolic propagation, but having a single one is more
+ * efficient (time- and memory-wise). *)
+and svalue = Lit of literal | Cst of const_type | Sym of expr | NotCst
 
 and container_operator =
   | Array (* todo? designator? use ArrayAccess for designator? *)
@@ -502,9 +623,10 @@ and container_operator =
    *)
   | Tuple
 
-(* For Python/HCL (and Haskell later). The 'expr' is a 'Tuple' to
+(* For Python/HCL (and Haskell later). The 'expr' can be a 'Tuple' to
  * represent a Key/Value pair (like in Container). See keyval() below.
- * newscope:
+ * newscope: for_or_if_comp introduce new local variables whose scope
+ *  is just the first expr.
  *)
 and comprehension = expr * for_or_if_comp list
 
@@ -513,6 +635,23 @@ and for_or_if_comp =
   (* newvar: *)
   | CompFor of tok (*'for'*) * pattern * tok (* 'in' *) * expr
   | CompIf of tok (*'if'*) * expr
+
+and field_name =
+  (* In the case of a field, it may be hard to resolve the id_info inside name.
+   * For example, a method id can refer to many method definitions.
+   * But for certain things, like a private field, we can resolve it
+   * (right now we use an EnclosedVar for those fields).
+   *
+   * The IdQualified inside name is Useful for OCaml field access.
+   *)
+  | FN of name
+  (* less: FEllipsis instead of DotAccessEllipsis; can also be
+   * represented in theory by FDynamic (Ellipsis)
+   *)
+  (* for PHP/JS fields (even though JS use ArrayAccess for that), or Ruby
+   * or C++ ArrowStarAccess ->*
+   *)
+  | FDynamic of expr
 
 (* It's useful to keep track in the AST of all those special identifiers.
  * They need to be handled in a special way by certain analysis and just
@@ -536,14 +675,10 @@ and special =
   (* special calls *)
   | Eval
   | Typeof (* for C? and Go in switch x.(type) *)
+  (* todo? make a SpecialType, also use for ClassLiteral *)
   | Instanceof
   | Sizeof (* takes a ArgType *)
   | Defined (* defined? in Ruby, other? *)
-  (* Note that certain languages do not have a 'new' keyword
-   * (e.g., Python, Scala 3), instead certain 'Call' are really 'New'.
-   * Note that 'new' by itself is not a valid expression
-   *)
-  | New (* usually associated with Call(New, [ArgType _;...]) *)
   (* used for interpolated strings constructs
    * TODO: move out of 'special' and make special construct InterpolatedConcat
    * in 'expr' instead of abusing Call for that? that way can also
@@ -571,8 +706,9 @@ and special =
   (* Similar to Spread, but for a var containing a hashtbl.
    * The corresponding constructor in a parameter context is ParamHashSplat.
    *)
-  | HashSplat (* **x in Python/Ruby
-               * (not to confused with Pow below which is a Binary op *)
+  | HashSplat
+    (* **x in Python/Ruby
+     * (not to confused with Pow below which is a Binary op *)
   | ForOf (* Javascript, for generators, used in ForEach *)
   (* used for unary and binary operations
    * TODO: move out of special too, in separate OpCall? (where can also
@@ -642,10 +778,12 @@ and operator =
    *)
   | Elvis (* ?: in Kotlin, can compare possible null value *)
   | Nullish (* ?? in Javascript *)
-  | In
-  (* in: checks that value belongs to a collection *)
+  | In (* in: checks that value belongs to a collection *)
   | NotIn (* !in *)
-  (* is: checks value has type *)
+  (* Is (and NotIs) checks whether a value has a certain type.
+   * The second argument in OpCall is always an ArgType!
+   * Can also be used as an unary operation in Kotlin in a 'when'
+   *)
   | Is
   | NotIs
   (* Shell & and | *)
@@ -654,7 +792,6 @@ and operator =
 
 (* '++', '--' *)
 and incr_decr = Incr | Decr
-
 and prefix_postfix = Prefix | Postfix
 
 and concat_string_kind =
@@ -671,9 +808,9 @@ and concat_string_kind =
    * and some semgrep users may want to explicitely match only f-strings,
    * which is why we record this information here.
    * update: also use for interpolated Scala strings
-   * TODO: add of string ('f' or something else)
+   * update: add string argument to support arbitary string interpolaters in scala
    *)
-  | FString
+  | FString of string
   (* Javascript uses a special syntax called tagged template literals, e.g.,
    * foo`template string = ${id}`. We must use a different representation
    * for foo(`template string = ${id}`) because some semgrep users want
@@ -712,7 +849,7 @@ and xml_attribute =
 and a_xml_attr_value = expr
 
 and xml_body =
-  (* sgrep-ext: can contain "..." *)
+  (* sgrep-ext: can contain "...". The string can also contain multiple lines *)
   | XmlText of string wrap
   (* this can be None when people abuse {} to put comments in it *)
   | XmlExpr of expr option bracket
@@ -726,59 +863,19 @@ and argument =
   | Arg of expr (* can be Call (IdSpecial Spread, Id foo) *)
   (* keyword argument *)
   | ArgKwd of ident * expr
+  (* optional keyword argument. This is the same as a keyword argument
+     except that a match is valid if such argument exists in the target
+     code but not in the pattern.
+
+     Warning: ArgKwdOptional arguments must be placed at the end of the
+              list of arguments so as to not shift the positional arguments
+              (Arg) and allow them to match.
+  *)
+  | ArgKwdOptional of ident * expr
   (* type argument for New, instanceof/sizeof/typeof, C macros *)
   | ArgType of type_
-  (* e.g., ArgMacro for C/Rust, ArgQuestion for OCaml *)
-  | ArgOther of todo_kind * any list
-
-(* todo: reduce, or move in other_special? *)
-and other_expr_operator =
-  (* Javascript *)
-  | OE_Exports
-  | OE_Module
-  | OE_Define
-  | OE_Arguments
-  | OE_NewTarget
-  | OE_Delete
-  | OE_YieldStar
-  (* note: some of them are transformed in ImportFrom in js_to_generic.ml *)
-  | OE_Require
-  | OE_UseStrict (* todo: lift up to program attribute/directive? *)
-  (* Python *)
-  | OE_Invert
-  | OE_Slices (* see also SliceAccess *)
-  | OE_CmpOps
-  | OE_Repr (* todo: move to special, special Dump *)
-  (* Java *)
-  | OE_NameOrClassType
-  | OE_ClassLiteral
-  | OE_NewQualifiedClass
-  | OE_Annot
-  (* C *)
-  | OE_GetRefLabel
-  | OE_ArrayInitDesignator (* [x] = ... todo? use ArrayAccess in container?*)
-  (* PHP *)
-  | OE_Unpack
-  | OE_ArrayAppend (* $x[]. The AST for $x[] = 1 used to be
-                    * handled as an AssignOp with special Append, but we now
-                    * use OE_ArrayAppend for everything to simplify.
-                    *)
-  (* OCaml *)
-  | OE_RecordWith
-  | OE_RecordFieldName
-  (* Go *)
-  | OE_Send
-  | OE_Recv
-  (* Ruby *)
-  | OE_Subshell
-  (* Rust *)
-  | OE_MacroInvocation
-  (* C# *)
-  | OE_Checked
-  | OE_Unchecked
-  (* Other *)
-  | OE_StmtExpr (* OCaml/Ruby have just expressions, no statements *)
-  | OE_Todo
+  (* e.g., ArgMacro for C/Rust, ArgQuestion for OCaml, ArgIds in Solidity *)
+  | OtherArg of todo_kind * any list
 
 (*****************************************************************************)
 (* Statement *)
@@ -820,8 +917,8 @@ and stmt = {
      and before matching.
   *)
   (* used in semgrep to skip some AST matching *)
-  mutable s_bf : Bloom_filter.t option;
-      [@equal fun _a _b -> true] [@hash.ignore]
+  mutable s_strings : string Set_.t option;
+      [@equal fun _a _b -> true] [@hash.ignore] [@opaque]
   (* used to quickly get the range of a statement *)
   mutable s_range :
     (Parse_info.token_location * Parse_info.token_location) option;
@@ -837,28 +934,27 @@ and stmt_kind =
   (* EmptyStmt = Block [], or separate so can not be matched by $S? $
    * see also emptystmt() at the end of this file.
    *)
-  (* newscope: for vardef in expr in C++/Go/... *)
+  (* newscope: for vardef in condition in C++/Go/... *)
   | If of tok (* 'if' or 'elif' *) * condition * stmt * stmt option
-  | While of tok * expr * stmt
+  | While of tok * condition * stmt
   | Return of tok * expr option * sc
   | DoWhile of tok * stmt * expr
   (* newscope: *)
   | For of tok (* 'for', 'foreach'*) * for_header * stmt
   (* The expr can be None for Go and Ruby.
-   * less: could be merged with ExprStmt (MatchPattern ...) *)
+   * less: could be merged with ExprStmt (MatchPattern ...)
+   * Also used for 'match' in OCaml/Scala/Rust
+   * The 'match'/'switch' token is infix in Scala and C# *)
   | Switch of
-      tok (* 'switch' or also 'select' in Go *)
+      tok
+      (* 'switch', also 'select' in Go, or 'case' in Bash, or 'match' in OCaml/Scala/Rust *)
       * condition option
-      * case_and_body list
-  (* todo: merge with Switch.
-   * In Scala and C# the match is infix (after the expr)
-   *)
-  | Match of tok * expr * action list
+      * case_and_body list (* TODO brace *)
   | Continue of tok * label_ident * sc
   | Break of tok * label_ident * sc
   (* todo? remove stmt argument? more symetric to Goto *)
   | Label of label * stmt
-  | Goto of tok * label
+  | Goto of tok * label * sc (* less: use label_ident for computed goto in C*)
   (* TODO? move in expr! in C++ the expr can be an option *)
   | Throw of tok (* 'raise' in OCaml, 'throw' in Java/PHP *) * expr * sc
   | Try of tok * stmt * catch list * finally option
@@ -866,7 +962,10 @@ and stmt_kind =
       tok (* 'with' in Python, 'using' in C# *)
       * stmt (* resource acquisition *)
       * stmt (* newscope: block *)
-  | Assert of tok * expr * expr option (* message *) * sc
+  (* old: was 'expr * expr option' for Python/Java, but better to generalize.
+   * alt: could move in expr and have Assert be an IdSpecial
+   *)
+  | Assert of tok * arguments * sc
   (* TODO? move this out of stmt and have a stmt_or_def_or_dir in Block?
    * or an item list where item is a stmt_or_def_or_dir (as well as field)
    *)
@@ -874,17 +973,23 @@ and stmt_kind =
   | DirectiveStmt of directive
   (* sgrep: *)
   | DisjStmt of stmt * stmt
-  (* this is important to correctly compute a CFG *)
-  | OtherStmtWithStmt of other_stmt_with_stmt_operator * expr option * stmt
-  (* any here should not contain any statement! otherwise the CFG will be
+  (* This is important to correctly compute a CFG. The any should not
+   * contain any stmt! *)
+  | OtherStmtWithStmt of other_stmt_with_stmt_operator * any list * stmt
+  (* any here should _not_ contain any statement! otherwise the CFG will be
    * incorrect and some analysis (e.g., liveness) will be incorrect.
    * TODO: other_stmt_operator wrap, so enforce at least one token instead
    * of relying that the any list contains at least one token
    *)
   | OtherStmt of other_stmt_operator * any list
 
-(* TODO: can also introduce var in some languages *)
-and condition = expr
+(* TODO: can also introduce var in some languages
+ * less: factorize with for_var_or_expr
+ *)
+and condition =
+  | Cond of expr
+  (* e.g., CondWithDecl, CondDecl in C++ *)
+  | OtherCond of todo_kind * any list
 
 (* newscope: *)
 (* less: could merge even more with pattern
@@ -896,50 +1001,80 @@ and case_and_body =
   (* sgrep: *)
   | CaseEllipsis of (* ... *) tok
 
+(* less: we use expr_to_pattern for many languages to build a Case so
+ * maybe we should instead have a CaseExpr and CasePattern?
+ *)
 and case =
   | Case of tok * pattern
+  (* less: could unsugar as Case (PatUnderscore _) *)
   | Default of tok
   (* For Go, expr can contain some Assign bindings.
    * todo? could merge with regular Case? can 'case x := <-chan' be
    * transformed in a pattern?
    *)
   | CaseEqualExpr of tok * expr
-
-(* todo: merge with case at some point *)
-(* newscope: newvar: *)
-and action = pattern * expr
+  (* e.g., CaseRange for C++ *)
+  | OtherCase of todo_kind * any list
 
 (* newvar: newscope: usually a PatVar *)
-and catch = tok (* 'catch', 'except' in Python *) * pattern * stmt
+and catch = tok (* 'catch', 'except' in Python *) * catch_exn * stmt
+
+(* alt: we could reuse parameter, which has a ParamPattern and ParamClassic *)
+and catch_exn =
+  | CatchPattern of pattern
+  (* for Java/C++/PHP/etc.
+   * old: PatVar of type_ * (ident * id_info) option
+   * and was in pattern as PatVar, but better to move out of pattern.
+   * alt: we could abuse pattern and use PatTyped, but ugly.
+   *)
+  | CatchParam of parameter_classic
+  (* e.g., CatchEmpty/CatchParams in Solidity *)
+  | OtherCatch of todo_kind * any list
+
+(* ptype should never be None *)
 
 (* newscope: *)
 and finally = tok (* 'finally' *) * stmt
-
 and label = ident
 
 and label_ident =
   | LNone (* C/Python *)
   | LId of label (* Java/Go/Kotlin *)
   | LInt of int wrap (* PHP *)
-  (* PHP, woohoo, dynamic break! bailout for CFG *)
+  (* PHP, woohoo, dynamic break! bailout for CFG, also in C gccext: goto *)
   | LDynamic of expr
 
+(* todo? put also user-defined iterators here? like MacroIteration in C++ *)
 and for_header =
   (* todo? copy Go and have 'of simple option * expr * simple option'? *)
   | ForClassic of
-      for_var_or_expr list (* init *) * expr option (* cond *) * expr option (* next *)
+      for_var_or_expr list (* init *)
+      * expr option (* cond *)
+      * expr option (* next *)
   (* newvar: *)
-  | ForEach of
-      pattern * tok (* 'in' Python, 'range' Go, 'as' PHP, '' Java *) * expr (* pattern 'in' expr *)
+  | ForEach of for_each
+  (* Scala *)
+  | MultiForEach of multi_for_each list
   (* Lua. todo: merge with ForEach? *)
   (* pattern 'in' expr *)
   | ForIn of for_var_or_expr list (* init *) * expr list
   (* sgrep: *)
   | ForEllipsis of (* ... *) tok
 
+and for_each =
+  pattern
+  * tok (* 'in' Python, 'range' Go, 'as' PHP, '' Java, '<-' Scala *)
+  * expr (* pattern 'in' expr *)
+
+and multi_for_each =
+  | FE of for_each
+  | FECond of for_each * tok * expr
+  | FEllipsis of tok
+
 and for_var_or_expr =
   (* newvar: *)
   | ForInitVar of entity * variable_definition
+  (* less: should rename ForInitAssign really *)
   | ForInitExpr of expr
 
 and other_stmt_with_stmt_operator =
@@ -956,9 +1091,15 @@ and other_stmt_with_stmt_operator =
   | OSWS_ConstBlock
   | OSWS_ForeignBlock
   | OSWS_ImplBlock
+  (* Java's synchronize / C#'s lock *)
+  | OSWS_Sync
   (* C# *)
   | OSWS_CheckedBlock
   | OSWS_UncheckedBlock
+  (* C/C++/cpp *)
+  | OSWS_Iterator
+  (* e.g., Assembly in Solidity *)
+  | OSWS_Todo
 
 and other_stmt_operator =
   (* Python *)
@@ -969,12 +1110,11 @@ and other_stmt_operator =
   | OS_TryOrElse
   | OS_ThrowFrom
   | OS_ThrowNothing
-  | OS_ThrowArgsLocation (* Python2: `raise expr, expr` and `raise expr, expr, exr` *)
+  | OS_ThrowArgsLocation
+    (* Python2: `raise expr, expr` and `raise expr, expr, exr` *)
   | OS_Pass
   | OS_Async
-  (* Java *)
-  | OS_Sync
-  (* C *)
+  (* C/C++ *)
   | OS_Asm
   (* Go *)
   | OS_Go
@@ -987,7 +1127,7 @@ and other_stmt_operator =
   | OS_Retry
   (* OCaml *)
   | OS_ExprStmt2
-  (* Other *)
+  (* Other: Leave/Emit in Solidity *)
   | OS_Todo
 
 (*****************************************************************************)
@@ -995,7 +1135,7 @@ and other_stmt_operator =
 (*****************************************************************************)
 (* This is quite similar to expr. A few constructs in expr have
  * equivalent here prefixed with Pat (e.g., PaLiteral, PatId). We could
- * maybe factorize with expr, and this may help sgrep, but I think it's
+ * maybe factorize with expr, and this may help semgrep, but I think it's
  * cleaner to have a separate type because the scoping rules for a pattern and
  * an expr are quite different and not any expr is allowed here.
  *)
@@ -1014,7 +1154,7 @@ and pattern =
   (* less: generalize to other container_operator? *)
   | PatList of pattern list bracket
   | PatKeyVal of pattern * pattern (* a kind of PatTuple *)
-  (* special case of PatId *)
+  (* special case of PatId, TODO: name PatAny *)
   | PatUnderscore of tok
   (* OCaml and Scala *)
   | PatDisj of pattern * pattern (* also abused for catch in Java *)
@@ -1023,15 +1163,13 @@ and pattern =
   | PatAs of pattern * (ident * id_info)
   (* For Go also in switch x.(type) { case int: ... } *)
   | PatType of type_
-  (* In catch for Java/PHP, and foreach in Java.
-   * less: do instead PatAs (PatType(TyApply, var))?
-   *       or even    PatAs (PatConstructor(id, []), var)?
-   *)
-  | PatVar of type_ * (ident * id_info) option
   (* sgrep: *)
   | PatEllipsis of tok
   | DisjPat of pattern * pattern
-  (* todo: Python should transform expr pattern via expr_to_pattern() *)
+  (* e.g., ???
+   * todo: Python should transform expr pattern via expr_to_pattern(),
+   * so maybe have a PatExpr like we have StmtExpr?
+   *)
   | OtherPat of todo_kind * any list
 
 (*****************************************************************************)
@@ -1044,11 +1182,21 @@ and type_ = {
 }
 
 and type_kind =
-  (* TODO: TyLiteral, for Scala *)
-  (* todo? a type_builtin = TInt | TBool | ...? see Literal.
-   * or just delete and use (TyN Id) instead?
+  (* old: was originally TyApply (name, []), but better to differentiate.
+   * old: there used to be also a 'TyBuiltin of string wrap' but simpler to
+   * just use (TyN Id) instead.
+   * todo? a type_builtin = TInt | TBool | ... that mimics the literal type?
+   * todo? may need also TySpecial because the name can actually be
+   *  self/parent/static (e.g., in PHP)
    *)
-  | TyBuiltin of string wrap (* int, bool, etc. could be TApply with no args *)
+  | TyN of name
+  (* covers list, hashtbl, etc.
+   * note: the type_ should always be a TyN, so really it's a TyNameApply
+   * but it's simpler to not repeat TyN to factorize code in semgrep regarding
+   * aliasing.
+   * TODO: could merge with TyN now that qualified_info has type_arguments
+   *)
+  | TyApply of type_ * type_arguments
   (* old: was 'TyFun of type_ list * type*' , but languages such as C and
    * Go allow also to name those parameters, and Go even allow ParamRest
    * parameters so we need at least 'type_ * attributes', at which point
@@ -1058,20 +1206,8 @@ and type_kind =
   (* a special case of TApply, also a special case of TPointer *)
   | TyArray of (* const_expr *) expr option bracket * type_
   | TyTuple of type_ list bracket
-  (* old: was originally TyApply (name, []), but better to differentiate.
-   * todo? may need also TySpecial because the name can actually be
-   *  self/parent/static (e.g., in PHP)
-   *)
-  | TyN of name
-  (* covers list, hashtbl, etc.
-   * note: the type_ should always be a TyN, so really it's a TyNameApply
-   * but it's simpler to not repeat TyN to factorize code in semgrep regarding
-   * aliasing.
-   * TODO: could merge with TyN when name has proper qualifiers?
-   *)
-  | TyApply of type_ * type_arguments
   | TyVar of ident (* type variable in polymorphic types (not a typedef) *)
-  (* anonymous type, '_' in OCaml, 'dynamic' in Kotlin
+  (* anonymous type, '_' in OCaml, 'dynamic' in Kotlin, 'auto' in C++.
    * TODO: type bounds Scala? *)
   | TyAny of tok
   | TyPointer of tok * type_
@@ -1085,18 +1221,34 @@ and type_kind =
   (* Anonymous record type, a.k.a shape in PHP/Hack. See also AndType.
    * Most record types are defined via a TypeDef and are then referenced
    * via a TyName. Here we have flexible record types (a.k.a. rows in OCaml).
-   * TODO: just generalize as TClass of name option * class_definition
+   *
+   * TODO? just generalize as TClass of name option * class_definition
    * for C++. Those are ugly because it would be cleaner to have
    * definitions only at the toplevel, but C/C++/Go allow those nested
    * class defs. We could lift them up at the top and introduce gensym'ed
    * classnames, but it's maybe better to stay close to the code.
+   *
+   * The Class(Struct) of class_kind are used for Hack and Go, and Interface
+   * only for Go.
    *)
-  | TyRecordAnon of tok (* 'struct/shape', fake in other *) * field list bracket
-  (* for Go *)
-  | TyInterfaceAnon of tok (* 'interface' *) * field list bracket
+  | TyRecordAnon of
+      class_kind wrap (* 'struct/shape', fake in other *) * field list bracket
+  (* TODO? a TyParen, like ParenExpr? A few languages may need that
+   * for autofix to work correctly.
+   *)
   (* sgrep-ext: *)
   | TyEllipsis of tok
-  | OtherType of other_type_operator * any list
+  (* For languages such as Python which abuse expr to represent types.
+   * At some point AST_generic_helpers.expr_to_type should be good enough
+   * to transpile every expr construct, but for now we have this.
+   * todo? have a TyLiteral of literal for Scala/JS, or use TyExpr for that?
+   *)
+  | TyExpr of expr
+  (* e.g., Struct/Union/Enum names (convert in unique TyName?), TypeOf/TSized
+   * TRefRef in C++, EnumAnon in C++/Hack, TyTodo in OCaml, TyLit in Scala/JS,
+   * lots of stuff in C#, Lifetime in Rust, Delegation in Kotlin
+   *)
+  | OtherType of todo_kind * any list
 
 (* <> in Java/C#/C++/Kotlin/Rust/..., [] in Scala and Go (for Map) *)
 and type_arguments = type_argument list bracket
@@ -1109,23 +1261,8 @@ and type_argument =
       tok (* '?' *) * (bool wrap (* extends|super, true=super *) * type_) option
   (* C++/Rust (Rust restrict expr to literals and ConstBlock) *)
   | TAExpr of expr
-  (* TODO? Rust Lifetime 'x, Kotlin use-site variance *)
+  (* e.g., Rust Lifetime 'x, Kotlin use-site variance *)
   | OtherTypeArg of todo_kind * any list
-
-and other_type_operator =
-  (* C *)
-  (* todo? convert in unique names with TyName? *)
-  | OT_StructName
-  | OT_UnionName
-  | OT_EnumName
-  (* PHP *)
-  | OT_Variadic (* ???? *)
-  (* Rust *)
-  | OT_Lifetime
-  (* Other *)
-  | OT_Expr
-  | OT_Arg (* Python: todo: should use expr_to_type() when can *)
-  | OT_Todo
 
 (*****************************************************************************)
 (* Attribute *)
@@ -1135,21 +1272,21 @@ and attribute =
   | KeywordAttr of keyword_attribute wrap
   (* a.k.a decorators, annotations *)
   | NamedAttr of tok (* '@' *) * name * arguments (* less: option *)
-  (* per-language specific keywords like 'transient', 'synchronized' *)
-  (* todo: Expr used for Python, but should transform in NamedAttr when can *)
+  (* e.g,, per-language specific keywords like 'transient', 'synchronized'
+   * todo: Expr used for Python, but should transform in NamedAttr when can *)
   | OtherAttribute of todo_kind * any list
 
 and keyword_attribute =
   (* the classic C modifiers (except Auto) *)
-  | Static
-  | Extern
+  | Static (* a.k.a Intern in Solidity *)
+  | Extern (* less: of string? like extern "C" in C++ or Rust *)
   | Volatile
   (* the classic C++ modifiers for fields/methods *)
   | Public
   | Private
   | Protected
-  | Abstract (* a.k.a virtual in C++ *)
-  (* for fields/methods in classes and also classes *)
+  | Abstract (* a.k.a virtual in C++/Solidity *)
+  (* for fields/methods in classes and also for classes themselves *)
   | Final
   | Override
   | Mutable (* 'var' in Scala *)
@@ -1160,6 +1297,7 @@ and keyword_attribute =
   (* '@interface' in Java, 'annotation class' in Kotlin *)
   | AnnotationClass
   | EnumClass
+  (* for Scala and Java *)
   | SealedClass
   (* for variables (JS) *)
   | Var
@@ -1201,20 +1339,32 @@ and definition = entity * definition_kind
  * entity (as in 'let (f: int -> int) = fun i -> i + 1), but we
  * currently abuse id_info.id_type for that.
  *
- * see special_multivardef_pattern below for many vardefs in one entity in
- * ident.
+ * Note that with the new entity_name type and EPattern, one entity value
+ * can actually correspond to the definition of multiple vairables.
+ *
  * less: could be renamed entity_def, and name is a kind of entity_use.
  *)
 and entity = {
   (* In Ruby you can define a class with a qualified name as in
    * class A::B::C, and even dynamically.
    * In C++ you can define a method with a class qualifier outside a class,
-   * hence the use of name_or_dynamic below and not just ident.
+   * hence the use of entity_name below and not just ident.
    *)
-  name : name_or_dynamic;
+  name : entity_name;
   attrs : attribute list;
   tparams : type_parameters;
 }
+
+(* old: used to be merged with field_name in a unique name_or_dynamic
+ * but we want multiple entities (via EPattern) just here, hence the fork.
+ *)
+and entity_name =
+  | EN of name
+  | EDynamic of expr
+  (* TODO: replace LetPattern and multivardef hack with that *)
+  | EPattern of pattern
+  (* e.g., AnonBitfield in C++ *)
+  | OtherEntity of todo_kind * any list
 
 and definition_kind =
   (* newvar: can be used also for methods or nested functions.
@@ -1225,6 +1375,7 @@ and definition_kind =
   (* newvar: can be used also for constants.
    * note: can contain special_multivardef_pattern!! ident in which case vinit
    * is the pattern assignment.
+   * TODO: still true? We should use EPattern for those cases no?
    *)
   | VarDef of variable_definition
   (* FieldDefColon can be used only inside a record (in a FieldStmt).
@@ -1260,41 +1411,46 @@ and definition_kind =
    * local.
    *)
   | UseOuterDecl of tok (* 'global' or 'nonlocal' in Python, 'use' in PHP *)
+  (* e.g., MacroDecl and MacroVar in C++, method alias in Ruby,
+   * BitField in C/C++, Event/Modifier in Solidity
+   *)
   | OtherDef of todo_kind * any list
 
 (* template/generics/polymorphic-type *)
-and type_parameter = {
-  (* alt: we could reuse entity here.
+and type_parameter =
+  | TP of type_parameter_classic
+  (* sgrep-ext: *)
+  | TParamEllipsis of tok
+  (* e.g., Lifetime in Rust, complex types in OCaml, HasConstructor in C#,
+   * regular Param in C++/Go, AnonTypeParam/TPRest/TPNested in C++
+   *)
+  | OtherTypeParam of todo_kind * any list
+
+and type_parameter_classic = {
+  (* it would be nice to reuse entity here, but then the types would be
+   * mutually recursive.
    * note: in Scala the ident can be a wildcard.
    *)
   tp_id : ident;
   tp_attrs : attribute list;
   (* upper type bounds (must-be-a-subtype-of)
-     alt: we could just use 'type_' and TyAnd to represent intersection types *)
+   * alt: we could just use 'type_' and TyAnd for intersection types *)
   tp_bounds : type_ list;
   (* for Rust/C++. Similar to parameter_classic, but with type here. *)
   tp_default : type_ option;
   (* declaration-site variance (Kotlin/Hack/Scala) *)
   tp_variance : variance wrap option;
-  (* everything else that does not fit *)
-  tp_constraints : type_parameter_constraint list;
 }
 
+(* TODO bracket *)
 and type_parameters = type_parameter list
 
-(* TODO bracket *)
+(* less: have also Invariant? *)
 and variance =
-  | Covariant (* '+' in Scala/Hack, 'out' in C#/Kotlin *)
+  (* '+' in Scala/Hack, 'out' in C#/Kotlin *)
+  | Covariant
+  (* '-' in Scala/Hack, 'in' in C#/Kotlin *)
   | Contravariant
-
-(* '-' in Scala/Hack, 'in' in C#/Kotlin *)
-
-(* less: Invariant? *)
-and type_parameter_constraint =
-  (* C# *)
-  | HasConstructor of tok
-  (* TODO? Lifetime Rust? *)
-  | OtherTypeParam of todo_kind * any list
 
 (* ------------------------------------------------------------------------- *)
 (* Function (or method) definition *)
@@ -1332,8 +1488,10 @@ and parameters = parameter list
 
 (* newvar: *)
 and parameter =
-  | ParamClassic of parameter_classic
-  | ParamPattern of pattern (* in OCaml, but also now JS, and Python2 *)
+  (* sgrep-ext: note that pname can be a metavariable *)
+  | Param of parameter_classic
+  (* in OCaml, but also now JS, Python2, Rust *)
+  | ParamPattern of pattern
   (* Both those ParamXxx used to be handled as a ParamClassic with special
    * VariadicXxx attribute in p_attr, but they are used in so many
    * languages that it's better to move then in a separate type.
@@ -1348,7 +1506,10 @@ and parameter =
   (* sgrep: ... in parameters
    * note: foo(...x) of Js/Go is using the ParamRest, not this *)
   | ParamEllipsis of tok
-  | OtherParam of other_parameter_operator * any list
+  (* e.g., ParamTodo in OCaml, Reciever param in Go, SingleStar and Slash
+   * in Python to delimit regular parameters from special one.
+   * TODO ParamRef of tok * parameter_classic in PHP/Ruby *)
+  | OtherParam of todo_kind * any list
 
 (* less: could be merged with variable_definition, or pattern
  * less: could factorize pname/pattrs/pinfo with entity
@@ -1362,18 +1523,6 @@ and parameter_classic = {
   (* naming *)
   pinfo : id_info; (* Always Param *)
 }
-
-and other_parameter_operator =
-  (* Python *)
-  (* single '*' or '/' to delimit regular parameters from special one *)
-  | OPO_SingleStarParam
-  | OPO_SlashParam
-  (* Go *)
-  | OPO_Receiver (* of parameter_classic, used to tag the "self" parameter*)
-  (* PHP/Ruby *)
-  | OPO_Ref (* of parameter_classic *)
-  (* Other *)
-  | OPO_Todo
 
 (* old: this used to be just an alias for 'stmt'; we were using
  * fake empty Block for FBDecl of fake ExprStmt for FBExpr.
@@ -1428,6 +1577,7 @@ and type_definition_kind =
   (* OCaml/Rust *)
   | AbstractType of tok (* usually a fake token *)
   | Exception of ident (* same name than entity *) * type_ list
+  (* e.g., TdTodo types in OCaml *)
   | OtherTypeKind of todo_kind * any list
 
 and or_type_element =
@@ -1464,11 +1614,10 @@ and or_type_element =
  * the variable declaration and field definition have a different syntax.
  * Note: the FieldStmt(DefStmt(FuncDef(...))) can have empty body
  * for interface methods.
+ * old: there was a special FieldSpread before (just for JS and Go) but we
+ * now abuse ExprStmt(IdSpecial(Spread)) to represent it.
  *)
-and field =
-  | FieldStmt of stmt
-  (* DEBT? could abuse FieldStmt(ExprStmt(IdSpecial(Spread))) for that? *)
-  | FieldSpread of tok (* ... *) * expr
+and field = F of stmt
 
 (* ------------------------------------------------------------------------- *)
 (* Class definition *)
@@ -1496,8 +1645,8 @@ and class_definition = {
  * for EnumClass/AnnotationClass/etc. see keyword_attribute.
  *)
 and class_kind =
-  | Class
-  | Interface
+  | Class (* or Struct for C/Solidity *)
+  | Interface (* abused for Contract in Solidity *)
   | Trait
   (* Kotlin/Scala *)
   | Object
@@ -1506,6 +1655,7 @@ and class_kind =
  * can be defined in the class header via cparams and then this class
  * header can call its parent constructor using those cparams).
  * alt: keep just 'type_' and add constructor calls in cbody.
+ * TODO: also can have visibility modifier in C++ or virtual
  *)
 and class_parent = type_ * arguments option
 
@@ -1529,13 +1679,16 @@ and module_definition_kind =
   | ModuleAlias of dotted_ident
   (* newscope: *)
   | ModuleStruct of dotted_ident option * item list
-  (* TODO: OCaml (functors and their applications) *)
+  (* e.g., OCaml functors *)
   | OtherModule of todo_kind * any list
 
 (* ------------------------------------------------------------------------- *)
 (* Macro definition *)
 (* ------------------------------------------------------------------------- *)
-(* Used by cpp in C/C++ *)
+(* Used by cpp in C/C++
+ * todo? differentiate MacroVar from MacroDef? some macro can take
+ * an empty list of parameters, but they are not MacroVar
+ *)
 and macro_definition = { macroparams : ident list; macrobody : any list }
 
 (*****************************************************************************)
@@ -1558,15 +1711,20 @@ and directive = {
 and directive_kind =
   (* newvar: *)
   | ImportFrom of
-      tok (* 'import'/'from' for Python, 'include' for C *)
+      tok (* 'import'/'from' for Python *)
       * module_name
       * ident
       * alias option (* as name alias *)
   | ImportAs of tok * module_name * alias option (* as name *)
-  (* bad practice! hard to resolve name locally *)
-  | ImportAll of tok * module_name * tok (* '.' in Go, '*' in Java/Python, '_' in Scala *)
+  (* Bad practice! hard to resolve name locally.
+   * We use ImportAll for C/C++ #include and C++ 'using namespace'.
+   * The last tok is '.' in Go, '*' in Java/Python, '_' in Scala, and a fake
+   * token in C++ 'using namespace std;'.
+   *)
+  | ImportAll of tok * module_name * tok
   (* packages are different from modules in that multiple files can reuse
-   * the same package name; they are agglomerated in the same package
+   * the same package name; they are agglomerated in the same package.
+   * The dotted_ident can be empty in C++.
    *)
   | Package of tok * dotted_ident (* a.k.a namespace *)
   (* This is used for languages such as C++/PHP/Scala with scoped namespaces.
@@ -1575,22 +1733,14 @@ and directive_kind =
    *)
   | PackageEnd of tok
   | Pragma of ident * any list
-  | OtherDirective of other_directive_operator * any list
+  (* e.g., Dynamic include in C, Extern "C" in C++/Rust, Undef in C++/Ruby,
+   * Export/Reexport in Javascript, Using in Solidity
+   * TODO: Declare, move OE_UseStrict here for JS?
+   *)
+  | OtherDirective of todo_kind * any list
 
 (* xxx as name *)
 and alias = ident * id_info
-
-and other_directive_operator =
-  (* Javascript *)
-  | OI_Export
-  | OI_ReExportNamespace
-  (* PHP *)
-  (* TODO: Declare, move OE_UseStrict here for JS? *)
-  (* Ruby *)
-  | OI_Alias
-  | OI_Undef
-  (* Rust *)
-  | OI_Extern
 
 (*****************************************************************************)
 (* Toplevel *)
@@ -1602,7 +1752,6 @@ and other_directive_operator =
  * TODO? make it an alias to stmt_or_def_or_dir instead?
  *)
 and item = stmt
-
 and program = item list
 
 (*****************************************************************************)
@@ -1613,13 +1762,18 @@ and partial =
   (* partial defs. The fbody or cbody in definition will be empty. *)
   | PartialDef of definition
   (* partial stmts *)
-  | PartialIf of tok * expr (* todo? bracket *)
+  | PartialIf of tok * expr (* todo? bracket? TODO? switch to condition? *)
   | PartialTry of tok * stmt
   | PartialCatch of catch
   | PartialFinally of tok * stmt
   | PartialMatch of tok * expr
   (* partial objects (just used in JSON and YAML patterns for now)
    * alt: todo? could be considered a full thing and use Fld?
+   * This matches single fields in field list bracket (in Record or cbody).
+   * Note that this actually also matches ArgKwd and certain List
+   * because in Go composite literals are translated in mix of Calls with
+   * ArgKwd and List/Tuples with pairs for fields.
+   * alt: have a PartialSingleFieldOrArgKwd special construct for Go?
    *)
   | PartialSingleField of string wrap (* id or str *) * tok (*:*) * expr
   (* not really a partial, but the partial machinery can help with that *)
@@ -1631,6 +1785,7 @@ and partial =
 
 (* mentioned in many OtherXxx so must be part of the mutually recursive type *)
 and any =
+  (* main patterns used for semgrep *)
   | E of expr
   | S of stmt
   | Ss of stmt list
@@ -1641,6 +1796,8 @@ and any =
   | Fld of field
   | Flds of field list
   | Args of argument list
+  | Params of parameter list
+  | Xmls of xml_body list
   | Partial of partial
   (* misc *)
   | I of ident
@@ -1651,15 +1808,19 @@ and any =
   | Tk of tok
   | TodoK of todo_kind
   | Ar of argument
-  (* todo: get rid of some? *)
+  | Pa of parameter
+  | Tp of type_parameter
+  | Ta of type_argument
   | Modn of module_name
+  | Ce of catch_exn
+  | Cs of case
+  | ForOrIfComp of for_or_if_comp
+  (* todo: get rid of some? *)
   | ModDk of module_definition_kind
   | En of entity
-  | Pa of parameter
   | Dk of definition_kind
   | Di of dotted_ident
   | Lbli of label_ident
-  | NoD of name_or_dynamic
   (* Used only for Rust macro arguments for now *)
   | Anys of any list
 [@@deriving show { with_path = false }, eq, hash]
@@ -1701,7 +1862,6 @@ let error tok msg = raise (Error (msg, tok))
  * and use the Parse_info.fake_info variant, not the unsafe_xxx one.
  *)
 let fake s = Parse_info.unsafe_fake_info s
-
 let fake_bracket x = (fake "(", x, fake ")")
 
 (* bugfix: I used to put ";" but now Parse_info.str_of_info prints
@@ -1725,7 +1885,7 @@ let s skind =
     s_id = AST_utils.Node_ID.create ();
     s_use_cache = false;
     s_backrefs = None;
-    s_bf = None;
+    s_strings = None;
     s_range = None;
   }
 
@@ -1747,21 +1907,36 @@ let p x = x
 (* Ident and names *)
 (* ------------------------------------------------------------------------- *)
 
+(* For Naming_X.ml in deep-semgrep.
+ * This can be reseted to 0 before parsing each file, or not. It does
+ * not matter as the couple (filename, id_info_id) is unique.
+ *)
+let id_info_id_counter = ref 0
+
+let id_info_id () : id_info_id =
+  incr id_info_id_counter;
+  !id_info_id_counter
+
 (* before Naming_AST.resolve can do its job *)
 let sid_TODO = -1
-
-let empty_name_info = { name_qualifier = None; name_typeargs = None }
-
 let empty_var = { vinit = None; vtype = None }
 
-let empty_id_info () =
-  { id_resolved = ref None; id_type = ref None; id_constness = ref None }
+let empty_id_info ?(hidden = false) () =
+  {
+    id_resolved = ref None;
+    id_type = ref None;
+    id_svalue = ref None;
+    id_hidden = hidden;
+    id_info_id = id_info_id ();
+  }
 
-let basic_id_info resolved =
+let basic_id_info ?(hidden = false) resolved =
   {
     id_resolved = ref (Some resolved);
     id_type = ref None;
-    id_constness = ref None;
+    id_svalue = ref None;
+    id_hidden = hidden;
+    id_info_id = id_info_id ();
   }
 
 (* TODO: move AST_generic_helpers.name_of_id and ids here *)
@@ -1771,8 +1946,8 @@ let basic_id_info resolved =
 (* ------------------------------------------------------------------------- *)
 
 (* alt: could use @@deriving make *)
-let basic_entity ?(attrs = []) ?(tparams = []) id =
-  let idinfo = empty_id_info () in
+let basic_entity ?hidden ?(attrs = []) ?(tparams = []) id =
+  let idinfo = empty_id_info ?hidden () in
   { name = EN (Id (id, idinfo)); attrs; tparams }
 
 (* ------------------------------------------------------------------------- *)
@@ -1786,9 +1961,9 @@ let arg e = Arg e
 (* Expressions *)
 (* ------------------------------------------------------------------------- *)
 let special spec es =
-  Call (IdSpecial spec |> e, fake_bracket (es |> List.map arg)) |> e
+  Call (IdSpecial spec |> e, fake_bracket (es |> Common.map arg)) |> e
 
-let opcall (op, t) es = special (Op op, t) es
+let opcall (op, tok) exprs : expr = special (Op op, tok) exprs
 
 (* TODO: have a separate InterpolatedConcat in expr with a cleaner type
  * instead of abusing special?
@@ -1803,13 +1978,13 @@ let interpolated (lquote, xs, rquote) =
         ( special,
           ( lquote,
             xs
-            |> List.map (function
+            |> Common.map (function
                  | Common.Left3 str -> Arg (L (String str) |> e)
                  | Common.Right3 (lbrace, eopt, rbrace) ->
                      let special =
                        IdSpecial (InterpolatedElement, lbrace) |> e
                      in
-                     let args = eopt |> Common.opt_to_list |> List.map arg in
+                     let args = eopt |> Option.to_list |> Common.map arg in
                      Arg (Call (special, (lbrace, args, rbrace)) |> e)
                  | Common.Middle3 e -> Arg e),
             rquote ) )
@@ -1829,7 +2004,7 @@ let param_of_id ?(pattrs = []) ?(ptype = None) ?(pdefault = None) id =
     pdefault;
     ptype;
     pattrs;
-    pinfo = basic_id_info (Param, sid_TODO);
+    pinfo = basic_id_info (Parameter, sid_TODO);
   }
 
 let param_of_type ?(pattrs = []) ?(pdefault = None) ?(pname = None) typ =
@@ -1838,15 +2013,20 @@ let param_of_type ?(pattrs = []) ?(pdefault = None) ?(pname = None) typ =
     pname;
     pdefault;
     pattrs;
-    pinfo = basic_id_info (Param, sid_TODO);
+    pinfo = basic_id_info (Parameter, sid_TODO);
   }
+
+(* ------------------------------------------------------------------------- *)
+(* Types *)
+(* ------------------------------------------------------------------------- *)
+let ty_builtin id = TyN (Id (id, empty_id_info ())) |> t
 
 (* ------------------------------------------------------------------------- *)
 (* Type parameters *)
 (* ------------------------------------------------------------------------- *)
 let tparam_of_id ?(tp_attrs = []) ?(tp_variance = None) ?(tp_bounds = [])
-    ?(tp_default = None) ?(tp_constraints = []) tp_id =
-  { tp_id; tp_attrs; tp_variance; tp_bounds; tp_default; tp_constraints }
+    ?(tp_default = None) tp_id =
+  TP { tp_id; tp_attrs; tp_variance; tp_bounds; tp_default }
 
 (* ------------------------------------------------------------------------- *)
 (* Statements *)
@@ -1865,8 +2045,7 @@ let emptystmt t = s (Block (t, [], t))
  * See also AST_generic_helpers with expr_to_pattern, expr_to_type,
  * pattern_to_expr, etc.
  *)
-let stmt_to_expr st = e (OtherExpr (OE_StmtExpr, [ S st ]))
-
+let stmt_to_expr st = e (StmtExpr st)
 let empty_body = fake_bracket []
 
 let stmt1 xs =
@@ -1880,13 +2059,13 @@ let stmt1 xs =
 (* ------------------------------------------------------------------------- *)
 
 (* this should be simpler at some point if we get rid of FieldStmt *)
-let fld (ent, def) = FieldStmt (s (DefStmt (ent, def)))
+let fld (ent, def) = F (s (DefStmt (ent, def)))
 
 let basic_field id vopt typeopt =
   let entity = basic_entity id in
   fld (entity, VarDef { vinit = vopt; vtype = typeopt })
 
-let fieldEllipsis t = FieldStmt (exprstmt (e (Ellipsis t)))
+let fieldEllipsis t = F (exprstmt (e (Ellipsis t)))
 
 (* ------------------------------------------------------------------------- *)
 (* Attributes *)
@@ -1903,3 +2082,23 @@ let unhandled_keywordattr (s, t) =
 (*****************************************************************************)
 
 let unbracket (_, x, _) = x
+
+(*****************************************************************************)
+(* Patterns *)
+(*****************************************************************************)
+
+let case_of_pat_and_expr ?(tok = None) (pat, expr) =
+  let tok =
+    match tok with
+    | None -> fake "case"
+    | Some tok -> tok
+  in
+  CasesAndBody ([ Case (tok, pat) ], exprstmt expr)
+
+let case_of_pat_and_stmt ?(tok = None) (pat, stmt) =
+  let tok =
+    match tok with
+    | None -> fake "case"
+    | Some tok -> tok
+  in
+  CasesAndBody ([ Case (tok, pat) ], stmt)

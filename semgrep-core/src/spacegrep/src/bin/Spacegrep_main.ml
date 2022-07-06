@@ -2,6 +2,9 @@
    Entrypoint for the 'spacegrep' command.
 *)
 
+(* for cmdliner >= 1.1.0 *)
+[@@@alert "-deprecated"]
+
 open Printf
 open Cmdliner
 open Spacegrep
@@ -10,10 +13,14 @@ let timeout_exit_code = 3
 
 type when_use_color = Auto | Always | Never
 
-type output_format = Text | Semgrep
+(* There used to be a Semgrep output_format when spacegrep was called
+ * from the Semgrep Python wrapper, but it's not the case anymore
+ *)
+type output_format = Text
 
 type config = {
   case_insensitive : bool;
+  ellipsis_max_span : int;
   color : when_use_color;
   output_format : output_format;
   debug : bool;
@@ -25,12 +32,20 @@ type config = {
   timeout : int option;
   warn : bool;
   no_skip_search : bool;
+  comment_style : Comment.style;
 }
+
+(* Those 2 types below are copy-pasted from Semgrep_core_response.atd
+ * but duplicated here to avoid some dependencies between spacegrep and
+ * semgrep-core.
+ *)
+type skip_reason = Minified | Binary
+type skipped_target = { path : string; reason : skip_reason; details : string }
 
 type matches = {
   matches :
     (Src_file.t * (int * Match.match_ list * float) list * float * float) list;
-  skipped : Semgrep_core_response_t.skipped_target list;
+  skipped : skipped_target list;
   num_analyzed : int;
   num_files : int;
   num_matches : int;
@@ -43,10 +58,18 @@ let detect_highlight when_use_color oc =
   | Never -> false
   | Auto -> Unix.isatty (Unix.descr_of_out_channel oc)
 
+let parse_pattern comment_style src =
+  let src = Comment.remove_comments_from_src comment_style src in
+  Parse_pattern.of_src src
+
+let parse_doc comment_style src =
+  let src = Comment.remove_comments_from_src comment_style src in
+  Parse_doc.of_src src
+
 (*
    Run all the patterns on all the documents.
 *)
-let run_all ~case_sensitive ~debug ~force ~warn ~no_skip_search patterns docs :
+let run_all ~search_param ~debug ~force ~warn ~comment_style patterns docs :
     matches =
   let num_files = ref 0 in
   let num_analyzed = ref 0 in
@@ -73,11 +96,10 @@ let run_all ~case_sensitive ~debug ~force ~warn ~no_skip_search patterns docs :
                   if warn then eprintf "ignoring minified file: %s\n%!" path;
                   skipped :=
                     {
-                      Semgrep_core_response_t.path;
+                      path;
                       reason = Minified;
                       details =
                         "not a source file: target file appears to be minified";
-                      skipped_rule = None;
                     }
                     :: !skipped;
                   None
@@ -85,10 +107,9 @@ let run_all ~case_sensitive ~debug ~force ~warn ~no_skip_search patterns docs :
                   if warn then eprintf "ignoring gibberish file: %s\n%!" path;
                   skipped :=
                     {
-                      Semgrep_core_response_t.path;
+                      path;
                       reason = Binary;
                       details = "target looks like a binary file";
-                      skipped_rule = None;
                     }
                     :: !skipped;
                   None
@@ -104,7 +125,7 @@ let run_all ~case_sensitive ~debug ~force ~warn ~no_skip_search patterns docs :
                     printf "parse document: %s\n%!"
                       (Src_file.source_string doc_src);
                   let doc, parse_time =
-                    Match.timef (fun () -> Parse_doc.of_src doc_src)
+                    Match.timef (fun () -> parse_doc comment_style doc_src)
                   in
                   let matches_in_file =
                     List.mapi
@@ -115,8 +136,7 @@ let run_all ~case_sensitive ~debug ~force ~warn ~no_skip_search patterns docs :
                             (Src_file.source_string doc_src)
                             (Src_file.source_string pat_src);
                         let matches_for_pat, match_time =
-                          Match.timed_search ~no_skip_search ~case_sensitive
-                            doc_src pat doc
+                          Match.timed_search search_param doc_src pat doc
                         in
                         num_matches :=
                           !num_matches + List.length matches_for_pat;
@@ -157,8 +177,9 @@ let run config =
     (match config.pattern with
     | None -> []
     | Some pat_str -> [ Src_file.of_string pat_str ])
-    @ List.map Src_file.of_file pattern_files
-    |> List.map (fun pat_src -> (pat_src, Parse_pattern.of_src pat_src))
+    @ Common.map Src_file.of_file pattern_files
+    |> Common.map (fun pat_src ->
+           (pat_src, parse_pattern config.comment_style pat_src))
   in
   let patterns, errors =
     let rev_patterns, rev_errors =
@@ -181,30 +202,33 @@ let run config =
         ]
     | roots ->
         let files = Find_files.list roots in
-        List.map (fun file ?max_len () -> Src_file.of_file ?max_len file) files
+        Common.map
+          (fun file ?max_len () -> Src_file.of_file ?max_len file)
+          files
   in
   let debug = config.debug in
   if debug then Match.debug := true;
   let highlight = detect_highlight config.color stdout in
   let {
     matches;
-    skipped;
+    skipped = _;
     num_analyzed;
     num_files;
     num_matches;
     num_matching_files;
   } =
-    run_all
-      ~case_sensitive:(not config.case_insensitive)
-      ~debug ~force:config.force ~warn:config.warn
-      ~no_skip_search:config.no_skip_search patterns docs
+    let search_param =
+      Match.create_search_param ~no_skip_search:config.no_skip_search
+        ~case_sensitive:(not config.case_insensitive)
+        ~ellipsis_max_span:config.ellipsis_max_span ()
+    in
+    run_all ~search_param ~debug ~force:config.force ~warn:config.warn
+      ~comment_style:config.comment_style patterns docs
   in
   (match config.output_format with
   | Text ->
       Match.print_nested_results ~with_time:config.time ~highlight matches
-        errors
-  | Semgrep ->
-      Semgrep.print_semgrep_json ~with_time:config.time matches errors skipped);
+        errors);
   if debug then (
     printf "\nanalyzed %i files out of %i\n" num_analyzed num_files;
     printf "found %i matches in %i files\n" num_matches num_matching_files)
@@ -232,14 +256,12 @@ let output_format_conv =
   let parser s =
     match s with
     | "text" -> Ok Text
-    | "semgrep" -> Ok Semgrep
     | s -> Error (`Msg ("Invalid output format: " ^ s))
   in
   let printer fmt output_format =
     let s =
       match output_format with
       | Text -> "text"
-      | Semgrep -> "semgrep"
     in
     Format.pp_print_string fmt s
   in
@@ -256,6 +278,20 @@ let case_insensitive_term =
          \\$A' will match 'foo + foo' but not 'foo + Foo'."
   in
   Arg.value (Arg.flag info)
+
+let ellipsis_max_span_term =
+  let default = Match.default_search_param.ellipsis_max_span in
+  let info =
+    Arg.info
+      [ "ellipsis-max-span"; "e" ]
+      ~doc:
+        (sprintf
+           "Maximum number of newlines a single ellipsis pattern ('...') can \
+            match. The default is %i newlines. The value 0 will force the \
+            matched items to be all on the same line."
+           default)
+  in
+  Arg.value (Arg.opt Arg.int default info)
 
 let color_term =
   let info =
@@ -379,15 +415,22 @@ let no_skip_search_term =
   Arg.value (Arg.flag info)
 
 let cmdline_term =
-  let combine case_insensitive color output_format debug force pattern
-      pattern_files anon_doc_file doc_files time timeout warn no_skip_search =
+  let combine case_insensitive ellipsis_max_span color output_format debug force
+      pattern pattern_files anon_doc_file doc_files time timeout warn
+      no_skip_search comment_style eol_comment_start multiline_comment_start
+      multiline_comment_end =
     let doc_files =
       match anon_doc_file with
       | None -> doc_files
       | Some x -> x :: doc_files
     in
+    let comment_style =
+      Comment.CLI.merge_comment_options ~comment_style ~eol_comment_start
+        ~multiline_comment_start ~multiline_comment_end
+    in
     {
       case_insensitive;
+      ellipsis_max_span;
       color;
       output_format;
       debug;
@@ -399,13 +442,17 @@ let cmdline_term =
       timeout;
       warn;
       no_skip_search;
+      comment_style;
     }
   in
   Term.(
-    const combine $ case_insensitive_term $ color_term $ output_format_term
-    $ debug_term $ force_term $ pattern_term $ pattern_file_term
-    $ anon_doc_file_term $ doc_file_term $ time_term $ timeout_term $ warn_term
-    $ no_skip_search_term)
+    const combine $ case_insensitive_term $ ellipsis_max_span_term $ color_term
+    $ output_format_term $ debug_term $ force_term $ pattern_term
+    $ pattern_file_term $ anon_doc_file_term $ doc_file_term $ time_term
+    $ timeout_term $ warn_term $ no_skip_search_term
+    $ Comment.CLI.comment_style_term $ Comment.CLI.eol_comment_start_term
+    $ Comment.CLI.multiline_comment_start_term
+    $ Comment.CLI.multiline_comment_end_term)
 
 let doc = "match a pattern against any program"
 

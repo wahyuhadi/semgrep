@@ -48,8 +48,11 @@ type state = {
   exiti : F.nodei;
   (* Attaches labels to nodes. *)
   labels : (label_key, F.nodei) Hashtbl.t;
-  (* Gotos pending to be resolved. *)
+  (* Gotos pending to be resolved, a list of Goto nodes and the label
+   * to which they are jumping. *)
   gotos : (nodei * label_key) list ref;
+  (* If we are inside a Try, this is the start of the handlers. *)
+  try_catches_opt : F.nodei option;
 }
 
 (*****************************************************************************)
@@ -58,9 +61,15 @@ type state = {
 
 let add_arc (starti, nodei) g = g#add_arc ((starti, nodei), F.Direct)
 
-let add_arc_opt (starti_opt, nodei) g =
+let add_arc_from_opt (starti_opt, nodei) g =
   starti_opt
-  |> Common.do_option (fun starti -> g#add_arc ((starti, nodei), F.Direct))
+  |> Option.iter (fun starti -> g#add_arc ((starti, nodei), F.Direct))
+
+let add_arc_opt_to_opt (starti_opt, nodei_opt) g =
+  starti_opt
+  |> Option.iter (fun starti ->
+         nodei_opt
+         |> Option.iter (fun nodei -> g#add_arc ((starti, nodei), F.Direct)))
 
 let key_of_label ((str, _tok), sid) : label_key = (str, sid)
 
@@ -121,10 +130,40 @@ type cfg_stmt_result =
 let rec cfg_stmt : state -> F.nodei option -> stmt -> cfg_stmt_result =
  fun state previ stmt ->
   match stmt.s with
-  | Instr x ->
+  | Instr x -> (
       let newi = state.g#add_node { F.n = F.NInstr x } in
-      state.g |> add_arc_opt (previ, newi);
-      CfgFirstLast (newi, Some newi)
+      state.g |> add_arc_from_opt (previ, newi);
+      match x.i with
+      | Call _ ->
+          (* If we are inside a try-catch, we consider the possibility of this call
+           * raising an exception, then we add a jump to catch-blocks. This could
+           * lead to some false positives when running taint rules (since it's a
+           * may-analysis), but they are probably rare. For constant propagation
+           * this should reduce false positives (since it's a must-analysis).
+           * Ideally we should have a preceeding analysis that infers which calls
+           * may (or may not) raise exceptions. *)
+          state.g |> add_arc_opt_to_opt (Some newi, state.try_catches_opt);
+          CfgFirstLast (newi, Some newi)
+      | AssignAnon (_, Lambda fdef) ->
+          (* Lambdas are treated as statement blocks, kind of like IF-THEN blocks,
+           * the CFG does NOT capture the actual flow of data that goes into the
+           * lambda through its parameters, and back into the surrounding definition
+           * through its `return' statement.
+           *
+           * previ -> newi -> ... (lambda body) -> finallambda -> lasti
+           *               \__________________________________/
+           *
+           * TODO: In order to handle lambdas properly, we could either inline
+           * them, or "lift" them and then use an inter-procedural analysis.
+           *)
+          let lasti = state.g#add_node { F.n = F.Join } in
+          let finallambda =
+            cfg_stmt_list { state with exiti = lasti } (Some newi) fdef.fbody
+          in
+          state.g |> add_arc (newi, lasti);
+          state.g |> add_arc_from_opt (finallambda, lasti);
+          CfgFirstLast (newi, Some lasti)
+      | __else__ -> CfgFirstLast (newi, Some newi))
   | If (tok, e, st1, st2) -> (
       (* previ -> newi --->  newfakethen -> ... -> finalthen --> lasti -> <rest>
        *                |                                     |
@@ -133,7 +172,7 @@ let rec cfg_stmt : state -> F.nodei option -> stmt -> cfg_stmt_result =
        * The lasti can be a Join when there is no return in either branch.
        *)
       let newi = state.g#add_node { F.n = F.NCond (tok, e) } in
-      state.g |> add_arc_opt (previ, newi);
+      state.g |> add_arc_from_opt (previ, newi);
 
       let newfakethen = state.g#add_node { F.n = F.TrueNode } in
       let newfakeelse = state.g#add_node { F.n = F.FalseNode } in
@@ -161,7 +200,7 @@ let rec cfg_stmt : state -> F.nodei option -> stmt -> cfg_stmt_result =
        *                 |-> newfakelse
        *)
       let newi = state.g#add_node { F.n = NCond (tok, e) } in
-      state.g |> add_arc_opt (previ, newi);
+      state.g |> add_arc_from_opt (previ, newi);
 
       let newfakethen = state.g#add_node { F.n = F.TrueNode } in
       let newfakeelse = state.g#add_node { F.n = F.FalseNode } in
@@ -169,50 +208,62 @@ let rec cfg_stmt : state -> F.nodei option -> stmt -> cfg_stmt_result =
       state.g |> add_arc (newi, newfakeelse);
 
       let finalthen = cfg_stmt_list state (Some newfakethen) st in
-      state.g |> add_arc_opt (finalthen, newi);
+      state.g |> add_arc_from_opt (finalthen, newi);
       CfgFirstLast (newi, Some newfakeelse)
   | Label label -> CfgLabel label
   | Goto (tok, label) ->
       let newi = state.g#add_node { F.n = F.NGoto (tok, label) } in
-      state.g |> add_arc_opt (previ, newi);
+      state.g |> add_arc_from_opt (previ, newi);
       add_pending_goto state newi label;
       CfgFirstLast (newi, None)
   | Return (tok, e) ->
       let newi = state.g#add_node { F.n = F.NReturn (tok, e) } in
-      state.g |> add_arc_opt (previ, newi);
+      state.g |> add_arc_from_opt (previ, newi);
       state.g |> add_arc (newi, state.exiti);
-      (* the next statement if there is one will not be linked to
-       * this new node *)
       CfgFirstLast (newi, None)
   | Try (try_st, catches, finally_st) ->
-      (* TODO: This is not a proper CFG for try-catch-finally... but
-       * it's probably "good enough" for now! *)
-      (* previ -> newi -> try --> catch1 -|
-       *                      |->  ...   -|
-       *                      |-> catchN -|
-       *                      |-----------|-> newfakefinally -> finally
+      (* previ ->
+       * newi ->
+       * try -> catchesi --> catch1 -|
+       *                 |->  ...   -|
+       *                 |-> catchN -|
+       *                 |-----------|-> newfakefinally -> finally
+       *
        *)
-      let newi = state.g#add_node { F.n = F.TrueNode } in
-      state.g |> add_arc_opt (previ, newi);
-      let finaltry = cfg_stmt_list state (Some newi) try_st in
-      let newfakefinally = state.g#add_node { F.n = F.TrueNode } in
-      state.g |> add_arc_opt (finaltry, newfakefinally);
+      let newi = state.g#add_node { F.n = NOther (Noop "try") } in
+      state.g |> add_arc_from_opt (previ, newi);
+      let catchesi = state.g#add_node { F.n = NOther (Noop "catch") } in
+      let state' = { state with try_catches_opt = Some catchesi } in
+      let finaltry = cfg_stmt_list state' (Some newi) try_st in
+      state.g |> add_arc_from_opt (finaltry, catchesi);
+      let newfakefinally = state.g#add_node { F.n = NOther (Noop "finally") } in
+      state.g |> add_arc (catchesi, newfakefinally);
       catches
       |> List.iter (fun (_, catch_st) ->
-             let finalcatch = cfg_stmt_list state finaltry catch_st in
-             state.g |> add_arc_opt (finalcatch, newfakefinally));
+             let finalcatch = cfg_stmt_list state (Some catchesi) catch_st in
+             state.g |> add_arc_from_opt (finalcatch, newfakefinally));
       let finalfinally = cfg_stmt_list state (Some newfakefinally) finally_st in
+      (* If we're inside another Try then we assume that we could propagate up
+       * some unhandled exception. Otherwise we assume that we handled everything.
+       * THINK: Alternatively, we could add an arc to the exit node. *)
+      state.g |> add_arc_opt_to_opt (finalfinally, state.try_catches_opt);
       CfgFirstLast (newi, finalfinally)
-  | Throw (_, _) -> cfg_todo state previ stmt
+  | Throw (tok, e) ->
+      let newi = state.g#add_node { F.n = F.NThrow (tok, e) } in
+      state.g |> add_arc_from_opt (previ, newi);
+      (match state.try_catches_opt with
+      | None -> state.g |> add_arc (newi, state.exiti)
+      | Some catchesi -> state.g |> add_arc (newi, catchesi));
+      CfgFirstLast (newi, None)
   | MiscStmt x ->
       let newi = state.g#add_node { F.n = F.NOther x } in
-      state.g |> add_arc_opt (previ, newi);
+      state.g |> add_arc_from_opt (previ, newi);
       CfgFirstLast (newi, Some newi)
   | FixmeStmt _ -> cfg_todo state previ stmt
 
 and cfg_todo state previ stmt =
   let newi = state.g#add_node { F.n = F.NTodo stmt } in
-  state.g |> add_arc_opt (previ, newi);
+  state.g |> add_arc_from_opt (previ, newi);
   CfgFirstLast (newi, Some newi)
 
 and cfg_stmt_list state previ xs =
@@ -230,14 +281,25 @@ and cfg_stmt_list state previ xs =
            | CfgLabel label -> (previ, label :: labels))
          (previ, [])
   in
-  match (lasti_opt, labels) with
-  | Some lasti, l :: ls ->
-      (* If we had labels at the end of our stmt list, we create a dummy node to assign them to,
-         and connect it to the last node we looked at
-      *)
-      let dummyi = state.g#add_node { n = NOther Noop } in
+  match labels with
+  | l :: ls ->
+      (* If we have labels at the end of our list of stmt, we create a dummy
+       * node to assign them to. This happens when there are labels at the end
+       * of a function's body, for example:
+       *
+       *     void foo(x)
+       *     {
+       *       if (x > 0) goto label;
+       *       bar();
+       *       label:
+       *     }
+       *
+       * Such labels may be in the original sources, or they may be introduced
+       * by the AST-to-IL translation.
+       *)
+      let dummyi = state.g#add_node { n = NOther (Noop "return") } in
       label_node state (l :: ls) dummyi;
-      add_arc (lasti, dummyi) state.g;
+      state.g |> add_arc_from_opt (lasti_opt, dummyi);
       Some dummyi
   | _ -> lasti_opt
 
@@ -255,12 +317,20 @@ let (cfg_of_stmts : stmt list -> F.cfg) =
 
   let newi = enteri in
 
-  let state = { g; exiti; labels = Hashtbl.create 2; gotos = ref [] } in
+  let state =
+    {
+      g;
+      exiti;
+      labels = Hashtbl.create 2;
+      gotos = ref [];
+      try_catches_opt = None;
+    }
+  in
   let last_node_opt = cfg_stmt_list state (Some newi) xs in
   (* Must wait until all nodes have been labeled before resolving gotos. *)
   resolve_gotos state;
   (* maybe the body does not contain a single 'return', so by default
    * connect last stmt to the exit node
    *)
-  g |> add_arc_opt (last_node_opt, exiti);
-  { graph = g; entry = enteri }
+  g |> add_arc_from_opt (last_node_opt, exiti);
+  CFG.make g enteri

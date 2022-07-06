@@ -26,7 +26,8 @@ endif
 build:
 	$(MAKE) build-core
 	$(MAKE) -C toy-matcher
-	cd semgrep && pipenv install --dev
+	cd cli && pipenv install --dev
+	$(MAKE) -C cli build
 
 .PHONY: install
 install:
@@ -80,7 +81,7 @@ config:
 .PHONY: clean
 clean:
 	-$(MAKE) -C semgrep-core clean
-	-$(MAKE) -C semgrep clean
+	-$(MAKE) -C cli clean
 
 # Same as 'make clean' but may remove additional files, such as external
 # libraries installed locally.
@@ -93,23 +94,13 @@ gitclean:
 	git clean -dfX
 	git submodule foreach --recursive git clean -dfX
 
-# Replace semgrep version where needed, prior to a release.
-# Check result with 'git diff': it should replace the version ID in 3 spots.
-#
-.PHONY: bump
-bump:
-	@test -n "$(RELEASE)" || { echo "RELEASE is undefined"; exit 1; }
-	$(SED) 's/__VERSION__ = ".*"/__VERSION__ = "$(RELEASE)"/g' semgrep/semgrep/__init__.py
-	$(SED) 's/^    install_requires=\["semgrep==.*"\],$$/    install_requires=["semgrep==$(RELEASE)"],/g' setup.py
-	$(SED) 's/## Unreleased/## Unreleased\n\n## [$(RELEASE)](https:\/\/github.com\/returntocorp\/semgrep\/releases\/tag\/v$(RELEASE)) - $(shell date +'%m-%d-%Y')/g' CHANGELOG.md
-
-# Prepare a release branch. Must run as:
-#
-#  RELEASE=X.X.X make release
-#
+# Prepare a release branch interactively.
+# It's safe to run it multiple times.
 .PHONY: release
 release:
-	PIPENV_PIPFILE=scripts/release/Pipfile pipenv install --dev
-	PIPENV_PIPFILE=scripts/release/Pipfile pipenv run python scripts/release/cut_release_branch.py
-	$(MAKE) bump
-	PIPENV_PIPFILE=scripts/release/Pipfile pipenv run python scripts/release/bump_and_push_release.py
+	./scripts/release/bump
+
+.PHONY: test
+test:
+	$(MAKE) -C semgrep-core test
+	$(MAKE) -C cli test

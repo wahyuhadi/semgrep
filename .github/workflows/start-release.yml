@@ -1,0 +1,230 @@
+name: Trigger Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bumpVersionFragment:
+        description: "Version fragment to bump"
+        required: true
+        default: "feature"
+        type: "choice"
+        options:
+          - "feature"
+          - "bug"
+
+jobs:
+  release-setup:
+    name: Setup Release Branch
+    runs-on: ubuntu-20.04
+    outputs:
+      version: ${{ steps.next-version.outputs.next-version }}
+    steps:
+      - name: Get JWT for semgrep-ci GitHub App
+        id: jwt
+        uses: docker://public.ecr.aws/y9k7q4m1/devops/cicd:latest
+        env:
+          EXPIRATION: 600 # seconds
+          ISSUER: ${{ secrets.SEMGREP_CI_APP_ID }} # semgrep-ci GitHub App id
+          PRIVATE_KEY: ${{ secrets.SEMGREP_CI_APP_KEY }}
+      - name: Get token for semgrep-ci GitHub App
+        id: token
+        run: |
+          TOKEN="$(curl -X POST \
+          -H "Authorization: Bearer ${{ steps.jwt.outputs.jwt }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/app/installations/${{ secrets.SEMGREP_CI_APP_INSTALLATION_ID }}/access_tokens" | \
+          jq -r .token)"
+          echo "::add-mask::$TOKEN"
+          echo "::set-output name=token::$TOKEN"
+      - name: Check out code
+        uses: actions/checkout@v3
+        id: checkout
+        with:
+          submodules: "recursive"
+          ref: "${{ github.event.repository.default_branch }}"
+          token: "${{ steps.token.outputs.token }}"
+      - name: Pull Tags
+        id: pull-tags
+        # We don't want a full heavyweight checkout with full history
+        # checkout action only can get tags + full history, so do this separately.
+        # Don't need tags in submodules.
+        run: git fetch --no-recurse-submodules origin 'refs/tags/*:refs/tags/*'
+      - name: Get latest version
+        id: latest-version
+        run: |
+          LATEST_TAG=$(git tag --list "v*.*.*" | sort -V | tail -n 1 | cut -c 2- )
+          echo ::set-output name=latest-version::${LATEST_TAG}
+      - name: Bump release version
+        id: next-version
+        uses: christian-draeger/increment-semantic-version@9d04121fb4825e033aeeaaf6d42b44b8b4e81ac5
+        with:
+          current-version: "${{ steps.latest-version.outputs.latest-version }}"
+          version-fragment: "${{ github.event.inputs.bumpVersionFragment }}"
+      - name: Create release branch
+        id: release-branch
+        run: |
+          RELEASE_BRANCH="release-${{ steps.next-version.outputs.next-version }}"
+          git checkout -b ${RELEASE_BRANCH}
+          echo ::set-output name=release-branch::${RELEASE_BRANCH}
+      - name: Run `make release`
+        id: make-release
+        env:
+          SEMGREP_RELEASE_NEXT_VERSION: ${{ steps.next-version.outputs.next-version }}
+        run: make release
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+          cache: "pipenv"
+          cache-dependency-path: |
+            scripts/release/Pipfile.lock
+      - name: Update Changelog
+        working-directory: scripts/release
+        run: |
+          pip3 install pipenv==2022.6.7
+          pipenv install --dev
+          pipenv run towncrier build --yes --version ${{ steps.next-version.outputs.next-version }}
+      - name: Push release branch
+        id: push-release-branch
+        env:
+          SEMGREP_RELEASE_NEXT_VERSION: ${{ steps.next-version.outputs.next-version }}
+        run: |
+          git config user.name ${{ github.actor }}
+          git config user.email ${{ github.actor }}@users.noreply.github.com
+          git add --all
+          git commit -m "chore: Bump version to ${SEMGREP_RELEASE_NEXT_VERSION}"
+          git push --set-upstream origin ${{ steps.release-branch.outputs.release-branch }}
+      - name: Create PR
+        id: open-pr
+        env:
+          SOURCE: "${{ steps.release-branch.outputs.release-branch }}"
+          TARGET: "${{ github.event.repository.default_branch }}"
+          TITLE: "Release Version ${{ steps.next-version.outputs.next-version }}"
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          # check if the branch already has a pull request open
+
+          if gh pr list --head ${SOURCE} | grep -vq "no pull requests"; then
+              # pull request already open
+              echo "pull request from SOURCE ${SOURCE} to TARGET ${TARGET} is already open";
+              echo "cancelling release"
+              exit 1
+          fi
+
+          # open new pull request with the body of from the local template.
+          PR_URL=$(gh pr create --title "${TITLE}" --body-file ./.github/PULL_REQUEST_TEMPLATE/release_pr_template.md \
+            --base "${TARGET}" --head "${SOURCE}")
+
+          echo $PR_URL
+
+          #GH actions doesn't provide an easy way to determine this, so we capture the number and go from there.
+          PR_NUMBER=$(echo $PR_URL | sed 's|.*pull/\(.*\)|\1|')
+
+          echo "::set-output name=pr-number::$PR_NUMBER"
+      - name: Wait for checks to register
+        id: register-checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LEN_CHECKS=$(gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup --jq '.statusCheckRollup | length');
+
+          # Immediately after creation, the PR doesn't have any checks attached yet, wait until this is not the case
+          # If you immediately start waiting for checks, then it just fails saying there's no checks.
+          while [ ${LEN_CHECKS} = "0" ]; do
+            echo "No checks available yet"
+            sleep 1
+            LEN_CHECKS=$(gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup --jq '.statusCheckRollup | length');
+          done
+          echo "checks are valid"
+
+          echo ${LEN_CHECKS}
+
+          gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup
+      - name: Wait for checks to complete
+        id: wait-checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Wait for PR checks to finish
+          gh pr checks "${{ steps.open-pr.outputs.pr-number }}" --interval 90 --watch
+      - name: Get Current Num Checks
+        id: num-checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Once all checks are complete on the PR, find the number of checks so that we can wait for the new checks to register.
+          # We can't do this above because sometimes all checks aren't yet ready by the time the first one is, so we end up in a case where
+          # we aren't getting waiting for all checks.
+          LEN_CHECKS=$(gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup --jq '.statusCheckRollup | length');
+          echo "::set-output name=num-checks::${LEN_CHECKS}"
+      - name: Create release version tag
+        id: create-tag
+        run: |
+          git tag -a -m "Release ${{ steps.next-version.outputs.next-version }}" "v${{ steps.next-version.outputs.next-version }}"
+          git push origin "v${{ steps.next-version.outputs.next-version }}"
+      - name: Wait for release checks to register
+        id: register-release-checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LEN_CHECKS=$(gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup --jq '.statusCheckRollup | length');
+
+          # We need to wait for the new checks to register when the release tag is pushed
+          while [ ${LEN_CHECKS} = ${{ steps.num-checks.outputs.num-checks }} ]; do
+            echo "No checks available yet"
+            sleep 1
+            LEN_CHECKS=$(gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup --jq '.statusCheckRollup | length');
+          done
+          echo "checks are valid"
+
+          echo ${LEN_CHECKS}
+
+          gh pr view "${{ steps.open-pr.outputs.pr-number }}" --json statusCheckRollup
+      - name: Wait for release checks
+        id: wait-release-checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Wait for PR checks to finish
+          gh pr checks "${{ steps.open-pr.outputs.pr-number }}" --interval 90 --watch
+
+  validate-release-trigger:
+    needs: [release-setup]
+    name: Trigger Release Validation
+    uses: ./.github/workflows/validate-release.yml
+    secrets: inherit
+    with:
+      version: ${{needs.release-setup.outputs.version}}
+
+  notify-success:
+    needs: [release-setup, validate-release-trigger]
+    name: Notify of Success
+    runs-on: ubuntu-20.04
+    if: success()
+    steps:
+      - run: echo "${{needs.release-setup.outputs.version}}"
+      - name: Notify Success
+        run: |
+          curl --request POST \
+          --url  ${{ secrets.NOTIFICATIONS_URL }} \
+          --header 'content-type: application/json' \
+          --data '{
+            "version": "${{needs.release-setup.outputs.version}}",
+            "message": "Release Validation has succeeded!"
+          }'
+
+  notify-failure:
+    needs: [release-setup, validate-release-trigger]
+    name: Notify of Failure
+    runs-on: ubuntu-20.04
+    if: failure()
+    steps:
+      - name: Notify Failure
+        run: |
+          curl --request POST \
+          --url  ${{ secrets.NOTIFICATIONS_URL }} \
+          --header 'content-type: application/json' \
+          --data '{
+            "version": "${{needs.release-setup.outputs.version}}",
+            "message": "Release Validation has failed. Please see https://github.com/${{github.repository}}/actions/runs/${{github.run_id}} for more details!"
+          }'

@@ -1,4 +1,4 @@
-# Items added to this file will be ignored by bento.
+# Items added to this file will be ignored by Semgrep.
 #
 # This file uses .gitignore syntax:
 #
@@ -24,16 +24,16 @@
 # To ignore a file with a literal ':' character, escape it with
 # a backslash, e.g. "\:foo".
 
-# Ignore git items
-.gitignore
-.git/
-:include .gitignore
 semgrep-core/tests/
 
 # submodule, generated code
 semgrep-core/tree-sitter-lang/
 
 pfff/
-semgrep/tests/e2e/targets/
-semgrep/tests/performance/targets/
-semgrep/tests/e2e/snapshots/
+cli/tests/e2e/targets/
+cli/tests/performance/targets/
+cli/tests/e2e/snapshots/
+
+# rules being tested for performance
+perf/rules/
+perf/r2c-rules/

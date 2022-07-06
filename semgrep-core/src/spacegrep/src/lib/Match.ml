@@ -39,15 +39,18 @@ open Doc_AST
 open Pattern_AST
 
 let debug = ref false
-
 let phys_eq = ( == )
 
 (*** Public types ***)
 
+type search_param = {
+  no_skip_search : bool;
+  case_sensitive : bool;
+  ellipsis_max_span : int;
+}
+
 type pattern_id = int
-
 type region = Loc.t * Loc.t
-
 type capture = { value : string; loc : Loc.t }
 
 type match_ = {
@@ -64,6 +67,9 @@ type conf = {
   (* string equality function used to compare words, which can be
      case-insensitive. *)
   word_equal : string -> string -> bool;
+  (* original parameters, some of which don't need to be converted into
+     something else for faster matching *)
+  param : search_param;
 }
 
 (* Dots environment. *)
@@ -75,11 +81,16 @@ type dots = {
   opt_mvar : string option; (* the MVAR in $...MVAR *)
 }
 
+let create_search_param ?(no_skip_search = false) ?(case_sensitive = true)
+    ?(ellipsis_max_span = 10) () =
+  { no_skip_search; case_sensitive; ellipsis_max_span }
+
+let default_search_param = create_search_param ()
+
 (* Map from metavariables to their captured value, which is a Word. *)
 module Env = Map.Make (String)
 
 type env = (Loc.t * string) Env.t
-
 type match_result = Complete of env * Loc.t | Fail
 
 (* Continuation that matches the pattern against the empty document.
@@ -106,15 +117,16 @@ let case_insensitive_equal a b =
         raise Exit
     done;
     true
-  with Exit -> false
+  with
+  | Exit -> false
 
 (*
    Create or update the 'dots' object which indicates:
    1. that we're allowing to skip document nodes that don't match;
    2. and until which line we allow this skipping.
 *)
-let extend_dots ~dots:opt_dots opt_mvar (last_loc : Loc.t) =
-  let ellipsis_max_span = 10 (* lines *) in
+let extend_dots ~conf ~dots:opt_dots opt_mvar (last_loc : Loc.t) =
+  let ellipsis_max_span = conf.param.ellipsis_max_span in
   match (opt_dots, opt_mvar) with
   | None, _ ->
       (* Allow `...` to extend for at most 10 lines. *)
@@ -288,7 +300,7 @@ let rec match_ (conf : conf) ~(dots : dots option) (env : env)
                     match_ conf ~dots:None env last_loc pat2 doc cont
                   else Fail)))
   | Dots (_, opt_mvar) :: pat_tail, doc ->
-      let dots = extend_dots ~dots opt_mvar last_loc in
+      let dots = extend_dots ~conf ~dots opt_mvar last_loc in
       match_ conf ~dots env last_loc pat_tail doc cont
   | Atom (_, p) :: pat_tail, doc -> (
       match doc with
@@ -395,7 +407,7 @@ let starts_with_dots (pat : Pattern_AST.node list) =
 
 let convert_named_captures env =
   Env.bindings env
-  |> List.map (fun (name, (loc, value)) -> (name, { value; loc }))
+  |> Common.map (fun (name, (loc, value)) -> (name, { value; loc }))
 
 (*
 let to_string src match_ =
@@ -446,14 +458,14 @@ let convert_capture src (start_pos, _) (_, end_pos) =
 
    last_loc is the location of the last token of a match.
 *)
-let really_search ~case_sensitive src pat doc =
+let really_search param src pat doc =
   (* table of all matches we want to keep, keyed by end location,
      with at most one entry per end location. *)
   let conf =
     let word_equal =
-      if case_sensitive then String.equal else case_insensitive_equal
+      if param.case_sensitive then String.equal else case_insensitive_equal
     in
-    { src; word_equal }
+    { src; word_equal; param }
   in
   let end_loc_tbl = Hashtbl.create 100 in
   let fold = if starts_with_dots pat then fold_block_starts else fold_all in
@@ -482,10 +494,11 @@ let really_search ~case_sensitive src pat doc =
          | None -> assert false
          | Some selected_match -> phys_eq match_ selected_match)
 
-let search ~no_skip_search ~case_sensitive src pat doc =
+let search param src pat doc =
+  let case_sensitive = param.case_sensitive in
   (* optimization *)
-  if no_skip_search || Pre_match.may_match ~case_sensitive pat doc then
-    really_search ~case_sensitive src pat doc
+  if param.no_skip_search || Pre_match.may_match ~case_sensitive pat doc then
+    really_search param src pat doc
   else []
 
 let timef f =
@@ -494,8 +507,7 @@ let timef f =
   let t2 = Unix.gettimeofday () in
   (res, t2 -. t1)
 
-let timed_search ~no_skip_search ~case_sensitive src pat doc =
-  timef (fun () -> search ~no_skip_search ~case_sensitive src pat doc)
+let timed_search param src pat doc = timef (fun () -> search param src pat doc)
 
 let ansi_highlight s =
   match s with

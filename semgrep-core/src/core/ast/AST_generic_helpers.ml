@@ -40,38 +40,93 @@ let str_of_ident = fst
 let gensym_counter = ref 0
 
 (* see sid type in resolved_name *)
-(* see sid type in resolved_name *)
 let gensym () =
   incr gensym_counter;
   !gensym_counter
 
-(* TODO: refactor name_qualifier and correctly handle this,
- * and factorize code in name_of_ids by calling this function.
- *)
 let name_of_ids_with_opt_typeargs xs =
   match List.rev xs with
   | [] -> failwith "name_of_ids_with_opt_typeargs: empty ids"
   | [ (x, None) ] -> Id (x, empty_id_info ())
-  | (x, _toptTODO) :: xs ->
-      let qualif =
-        if xs = [] then None
-        else
-          Some
-            (QDots
-               (xs |> List.rev |> List.map fst (* TODO use typeargs in xs!! *)))
-      in
+  | (x, topt) :: xs ->
+      let qualif = if xs = [] then None else Some (QDots (xs |> List.rev)) in
       IdQualified
-        ( (x, { name_qualifier = qualif; name_typeargs = None (*TODO*) }),
-          empty_id_info () )
+        {
+          name_last = (x, topt);
+          name_middle = qualif;
+          name_top = None;
+          name_info = empty_id_info ();
+        }
 
-let name_of_ids ?(name_typeargs = None) xs =
+(* internal *)
+let name_to_qualifier = function
+  | Id (id, _idinfo) -> [ (id, None) ]
+  | IdQualified { name_last = id, topt; name_middle = qu; _ } ->
+      let rest =
+        match qu with
+        | None -> []
+        | Some (QDots xs) -> xs
+        (* TODO, raise exn? *)
+        | Some (QExpr _) -> []
+      in
+      rest @ [ (id, topt) ]
+
+(* used for Parse_csharp_tree_sitter.ml
+ * less: could move there? *)
+let add_id_opt_type_args_to_name name (id, topt) =
+  let qdots = name_to_qualifier name in
+  IdQualified
+    {
+      name_last = (id, topt);
+      name_middle = Some (QDots qdots);
+      name_top = None;
+      name_info = empty_id_info () (* TODO reuse from name?*);
+    }
+
+(* used for Parse_hack_tree_sitter.ml
+ * less: could move there? *)
+let add_type_args_to_name name type_args =
+  match name with
+  | Id (ident, id_info) ->
+      (* Only IdQualified supports typeargs *)
+      IdQualified
+        {
+          name_last = (ident, Some type_args);
+          name_middle = None;
+          name_top = None;
+          name_info = id_info;
+        }
+  | IdQualified qualified_info -> (
+      match qualified_info.name_last with
+      | _id, Some _x ->
+          IdQualified qualified_info
+          (* TODO: Enable raise Impossible *)
+          (* raise Impossible *)
+          (* Never should have to overwrite type args, but also doesn't make sense to merge *)
+      | id, None ->
+          IdQualified { qualified_info with name_last = (id, Some type_args) })
+
+let add_type_args_opt_to_name name topt =
+  match topt with
+  | None -> name
+  | Some t -> add_type_args_to_name name t
+
+let name_of_ids xs =
   match List.rev xs with
   | [] -> failwith "name_of_ids: empty ids"
   | [ x ] -> Id (x, empty_id_info ())
   | x :: xs ->
-      let qualif = if xs = [] then None else Some (QDots (List.rev xs)) in
+      let qualif =
+        if xs = [] then None
+        else Some (QDots (xs |> List.rev |> Common.map (fun id -> (id, None))))
+      in
       IdQualified
-        ((x, { name_qualifier = qualif; name_typeargs }), empty_id_info ())
+        {
+          name_last = (x, None);
+          name_middle = qualif;
+          name_top = None;
+          name_info = empty_id_info ();
+        }
 
 let name_of_id id = Id (id, empty_id_info ())
 
@@ -79,7 +134,7 @@ let name_of_dot_access e =
   let ( let* ) = Option.bind in
   let rec fetch_ids = function
     | G.N (G.Id (x, _)) -> Some [ x ]
-    | G.DotAccess (e1, _, G.EN (G.Id (x, _))) ->
+    | G.DotAccess (e1, _, G.FN (G.Id (x, _))) ->
         let* xs = fetch_ids e1.e in
         Some (xs @ [ x ])
     | ___else___ -> None
@@ -89,14 +144,23 @@ let name_of_dot_access e =
 
 (* TODO: you should not need to use that. This is mostly because
  * Constructor and PatConstructor currently takes a dotted_ident instead
- * of a name.
+ * of a name, and because module_name accepts only DottedName
+ * but C# and C++ allow names.
  *)
 let dotted_ident_of_name (n : name) : dotted_ident =
   match n with
   | Id (id, _) -> [ id ]
-  | IdQualified ((id, _nameinfoTODO), _) ->
-      (* TODO, look QDots, ... *)
-      [ id ]
+  | IdQualified { name_last = ident, _toptTODO; name_middle; _ } ->
+      let before =
+        match name_middle with
+        (* we skip the type parts in ds ... *)
+        | Some (QDots ds) -> ds |> Common.map fst
+        | Some (QExpr _) ->
+            logger#error "unexpected qualifier type";
+            []
+        | None -> []
+      in
+      before @ [ ident ]
 
 (* In Go a pattern can be a complex expressions. It is just
  * matched for equality with the thing it's matched against, so in that
@@ -109,10 +173,10 @@ let rec expr_to_pattern e =
   match e.e with
   | N (Id (id, info)) -> PatId (id, info)
   | Container (Tuple, (t1, xs, t2)) ->
-      PatTuple (t1, xs |> List.map expr_to_pattern, t2)
+      PatTuple (t1, xs |> Common.map expr_to_pattern, t2)
   | L l -> PatLiteral l
   | Container (List, (t1, xs, t2)) ->
-      PatList (t1, xs |> List.map expr_to_pattern, t2)
+      PatList (t1, xs |> Common.map expr_to_pattern, t2)
   | Ellipsis t -> PatEllipsis t
   (* Todo:  PatKeyVal *)
   | _ -> OtherPat (("ExprToPattern", fake ""), [ E e ])
@@ -124,26 +188,30 @@ let rec pattern_to_expr p =
   (match p with
   | PatId (id, info) -> N (Id (id, info))
   | PatTuple (t1, xs, t2) ->
-      Container (Tuple, (t1, xs |> List.map pattern_to_expr, t2))
+      Container (Tuple, (t1, xs |> Common.map pattern_to_expr, t2))
   | PatLiteral l -> L l
   | PatList (t1, xs, t2) ->
-      Container (List, (t1, xs |> List.map pattern_to_expr, t2))
+      Container (List, (t1, xs |> Common.map pattern_to_expr, t2))
   | OtherPat (("ExprToPattern", _), [ E e ]) -> e.e
-  | PatAs _
-  | PatVar _ ->
-      raise NotAnExpr
   | _ -> raise NotAnExpr)
   |> G.e
 
-let expr_to_type e =
-  (* TODO: diconstruct e and generate the right type (TyBuiltin, ...) *)
-  OtherType (OT_Expr, [ E e ]) |> G.t
+(* We would like to do more things here, like transform certain
+ * N in TyN, but we can't do that from the Xxx_to_generic.ml
+ * (e.g., Python_to_generic.ml). Indeed, certain transformations
+ * require Naming_AST to have correctly resolved certain Ids.
+ * See Graph_code_AST_xxx.expr_to_type_after_naming() below for that situation.
+ *)
+let expr_to_type e = TyExpr e |> G.t
 
 (* TODO: recognize foo(args)? like in Kotlin/Java *)
-let expr_to_class_parent e : class_parent =
-  (OtherType (OT_Expr, [ E e ]) |> G.t, None)
+let expr_to_class_parent e : class_parent = (expr_to_type e, None)
 
 (* See also exprstmt, and stmt_to_expr in AST_generic.ml *)
+
+let cond_to_expr = function
+  | Cond e -> e
+  | OtherCond (categ, xs) -> OtherExpr (categ, xs) |> G.e
 
 (* old: there was a stmt_to_item before *)
 (* old: there was a stmt_to_field before *)
@@ -179,32 +247,49 @@ let is_boolean_operator = function
     -> true
 *)
 
-let name_or_dynamic_to_expr name idinfo_opt =
-  (match (name, idinfo_opt) with
+(* this will be used for the lhs of an Assign. Maybe one day Assign
+ * will have a more precise type and we can be more precise too here.
+ *)
+let entity_name_to_expr name idinfo_opt =
+  match (name, idinfo_opt) with
   (* assert idinfo = _idinfo below? *)
-  | EN (Id (id, idinfo)), None -> N (Id (id, idinfo))
-  | EN (Id (id, _idinfo)), Some idinfo -> N (Id (id, idinfo))
-  | EN (IdQualified (n, idinfo)), None -> N (IdQualified (n, idinfo))
-  | EN (IdQualified (n, _idinfo)), Some idinfo -> N (IdQualified (n, idinfo))
-  | EDynamic e, _ -> e.e)
-  |> G.e
+  | EN (Id (id, idinfo)), None -> N (Id (id, idinfo)) |> G.e
+  | EN (Id (id, _idinfo)), Some idinfo -> N (Id (id, idinfo)) |> G.e
+  | EN (IdQualified n), None -> N (IdQualified n) |> G.e
+  | EN (IdQualified n), Some idinfo ->
+      N (IdQualified { n with name_info = idinfo }) |> G.e
+  | EDynamic e, _ -> e
+  | EPattern pat, _ -> G.OtherExpr (("EPattern", fake ""), [ P pat ]) |> G.e
+  | OtherEntity (categ, xs), _ -> G.OtherExpr (categ, xs) |> G.e
+
+let argument_to_expr arg =
+  match arg with
+  | Arg e -> e
+  | ArgKwd (id, e)
+  | ArgKwdOptional (id, e) ->
+      let n = name_of_id id in
+      let k = N n |> G.e in
+      G.keyval k (fake "") e
+  | ArgType _
+  | OtherArg _ ->
+      raise NotAnExpr
 
 (* used in controlflow_build and semgrep *)
 let vardef_to_assign (ent, def) =
-  let name = name_or_dynamic_to_expr ent.name None in
+  let name_or_expr = entity_name_to_expr ent.name None in
   let v =
     match def.vinit with
     | Some v -> v
     | None -> L (Null (Parse_info.unsafe_fake_info "null")) |> G.e
   in
-  Assign (name, Parse_info.unsafe_fake_info "=", v) |> G.e
+  Assign (name_or_expr, Parse_info.unsafe_fake_info "=", v) |> G.e
 
 (* used in controlflow_build *)
 let funcdef_to_lambda (ent, def) resolved =
   let idinfo = { (empty_id_info ()) with id_resolved = ref resolved } in
-  let name = name_or_dynamic_to_expr ent.name (Some idinfo) in
+  let name_or_expr = entity_name_to_expr ent.name (Some idinfo) in
   let v = Lambda def |> G.e in
-  Assign (name, Parse_info.unsafe_fake_info "=", v) |> G.e
+  Assign (name_or_expr, Parse_info.unsafe_fake_info "=", v) |> G.e
 
 let funcbody_to_stmt = function
   | FBStmt st -> st
@@ -218,8 +303,20 @@ let has_keyword_attr kwd attrs =
        | KeywordAttr (kwd2, _) -> kwd =*= kwd2
        | _ -> false)
 
+(* just used in cpp_to_generic.ml for now, could be moved there *)
+let parameter_to_catch_exn_opt p =
+  match p with
+  | Param p -> Some (CatchParam p)
+  | ParamEllipsis t -> Some (CatchPattern (PatEllipsis t))
+  | ParamPattern p -> Some (G.CatchPattern p)
+  (* TODO: valid in exn spec? *)
+  | ParamRest (_, _p)
+  | ParamHashSplat (_, _p) ->
+      None
+  | OtherParam _ -> None
+
 (*****************************************************************************)
-(* Abstract position and constness for comparison *)
+(* Abstract position and svalue for comparison *)
 (*****************************************************************************)
 
 (* update: you should now use AST_generic.equal_any which internally
@@ -232,7 +329,7 @@ let abstract_for_comparison_visitor recursor =
       M.default_visitor with
       M.kinfo = (fun (_k, _) i -> { i with Parse_info.token = Parse_info.Ab });
       M.kidinfo =
-        (fun (k, _) ii -> k { ii with AST_generic.id_constness = ref None });
+        (fun (k, _) ii -> k { ii with AST_generic.id_svalue = ref None });
     }
   in
   let vout = M.mk_visitor hooks in
@@ -261,13 +358,14 @@ let ac_matching_nf op args =
   (* yes... here we use exceptions like a "goto" to avoid the option monad *)
   let rec nf args1 =
     args1
-    |> List.map (function
+    |> Common.map (function
          | Arg e -> e
          | ArgKwd _
+         | ArgKwdOptional _
          | ArgType _
-         | ArgOther _ ->
+         | OtherArg _ ->
              raise_notrace Exit)
-    |> List.map nf_one |> List.flatten
+    |> Common.map nf_one |> List.flatten
   and nf_one e =
     match e.e with
     | Call ({ e = IdSpecial (Op op1, _tok1); _ }, (_, args1, _)) when op = op1
@@ -276,13 +374,13 @@ let ac_matching_nf op args =
     | _ -> [ e ]
   in
   if is_associative_operator op then (
-    try Some (nf args)
-    with Exit ->
-      logger#error
-        "ac_matching_nf: %s(%s): unexpected ArgKwd | ArgType | ArgOther"
-        (show_operator op)
-        (show_arguments (fake_bracket args));
-      None)
+    try Some (nf args) with
+    | Exit ->
+        logger#error
+          "ac_matching_nf: %s(%s): unexpected ArgKwd | ArgType | ArgOther"
+          (show_operator op)
+          (show_arguments (fake_bracket args));
+        None)
   else None
 
 let undo_ac_matching_nf tok op : expr list -> expr option = function

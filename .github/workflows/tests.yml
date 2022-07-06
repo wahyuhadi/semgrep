@@ -4,18 +4,18 @@ on:
   workflow_dispatch:
   pull_request:
     paths-ignore:
-      - '**.md'
+      - "**.md"
   push:
     branches:
       - develop
     paths-ignore:
-      - '**.md'
+      - "**.md"
 
 jobs:
   build-core:
-    name: Build and Test semgrep-core
+    name: build semgrep-core
     runs-on: ubuntu-latest
-    container: returntocorp/ocaml:alpine
+    container: returntocorp/ocaml:alpine-2022-06-09
     steps:
       - name: Pre-checkout fixes
         run: |
@@ -24,19 +24,174 @@ jobs:
           sudo mkdir -p "$github_cache_dir"
           sudo chmod -R 777 "$github_cache_dir"
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
+      - id: submodule-status
+        name: Get submodule version
+        run: echo ::set-output name=versions-hash::$(git submodule status --cached | sha256sum | cut -d" " -f1)
+      - name: Post-checkout fixes
+        run: ./.github/post-checkout
+      - name: Remove broken symlinks
+        run: find -L . -type l -exec rm {} \;
+      - id: core-cache
+        name: Check if this semgrep-core binary is cached
+        uses: actions/cache@v3
+        with:
+          path: ocaml-build-artifacts.tgz
+          key: "${{ runner.os }}-core-binary-${{ hashFiles('semgrep-core/**', '.github/workflows/tests.yml', 'scripts/install-alpine-semgrep-core') }}-${{ steps.submodule-status.outputs.versions-hash }}"
+      - name: Checkout
+        uses: actions/checkout@v3
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          submodules: recursive
+      - name: Install pipenv
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: sudo pip install pipenv==2022.6.7
+      - name: Cache OCaml build files
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          path: |
+            /home/user/.cache/pipenv
+            /home/user/.local/share/virtualenvs
+            /home/user/.dune
+            /home/user/.opam/download-cache
+            /home/user/.opam/*/.opam-switch/packages
+            /home/user/.opam/*/.opam-switch/sources
+          key: ${{ runner.os }}-ocamlbuild
+      - name: Build semgrep-core
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: ./scripts/install-alpine-semgrep-core
+        env:
+          DUNE_CACHE: enabled
+          DUNE_CACHE_STORAGE_MODE: copy
+          DUNE_CACHE_ROOT: /home/user/.dune
+          DUNE_CACHE_TRANSPORT: direct
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ocaml-build-artifacts
+          path: ocaml-build-artifacts.tgz
+
+  build-docker:
+    name: build docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build image
+        uses: docker/build-push-action@v3
+        with:
+          load: true
+          tags: candidate-image
+          cache-from: type=gha,src=/tmp/.buildx-cache
+          cache-to: type=gha,dest=/tmp/.buildx-cache,mode=max
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Check the semgrep Docker image
+        run: ./scripts/validate-docker-build.sh candidate-image
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        if: github.actor != 'dependabot[bot]' && (github.event.pull_request.head.repo.full_name == github.repository || github.ref == 'refs/heads/develop')
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - id: meta
+        name: Set tags and labels
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ github.repository }}
+          # :latest is also added automatically
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+            type=ref,event=branch
+            type=sha,event=branch
+            type=edge
+
+      - name: Push image
+        uses: docker/build-push-action@v3
+        if: github.ref == 'refs/heads/develop' || (github.actor != 'dependabot[bot]' && !(github.event.pull_request.head.repo.full_name != github.repository))
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,src=/tmp/.buildx-cache
+          cache-to: type=gha,dest=/tmp/.buildx-cache,mode=max
+
+      - id: dev-meta
+        name: Set tags and labels
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ github.repository }}-dev
+          # :latest is also added automatically
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+            type=ref,event=branch
+            type=sha,event=branch
+            type=edge
+
+      # Extend the semgrep image, changing the entry point to bash and
+      # adding some utilities. This image is meant for internal uses
+      # such as benchmarks.
+      - name: Push dev image
+        uses: docker/build-push-action@v3
+        if: github.ref == 'refs/heads/develop'
+        with:
+          push: true
+          file: dockerfiles/semgrep-dev.Dockerfile
+          platforms: ${{ matrix.platform }}
+          tags: ${{ steps.dev-meta.outputs.tags }}
+          labels: ${{ steps.dev-meta.outputs.labels }}
+          cache-from: type=gha,src=/tmp/.buildx-cache
+          cache-to: type=gha,dest=/tmp/.buildx-cache,mode=max
+
+  test-core:
+    # TODO: use the artifact of build-core in this job
+    name: test semgrep-core
+    runs-on: ubuntu-latest
+    container: returntocorp/ocaml:alpine-2022-06-09
+    steps:
+      - name: Install pipenv
+        run: sudo pip install pipenv==2022.6.7
+      - name: Pre-checkout fixes
+        run: |
+          sudo chmod -R 777 /github
+          github_cache_dir="/__w"
+          sudo mkdir -p "$github_cache_dir"
+          sudo chmod -R 777 "$github_cache_dir"
+      - name: Checkout
+        uses: actions/checkout@v3
         with:
           submodules: true
       - name: Post-checkout fixes
         run: ./.github/post-checkout
-      - name: Build semgrep-core and spacegrep
-        run: ./scripts/install-alpine-semgrep-core
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v1
+      - name: Cache OCaml build files
+        uses: actions/cache@v3
         with:
-          name: ocaml-build-artifacts
-          path: ocaml-build-artifacts.tgz
-      - name: Test semgrep-core and spacegrep
+          path: |
+            /home/user/.cache/pipenv
+            /home/user/.local/share/virtualenvs
+            /home/user/.dune
+            /home/user/.opam/download-cache
+            /home/user/.opam/*/.opam-switch/packages
+            /home/user/.opam/*/.opam-switch/sources
+          key: ${{ runner.os }}-ocamlbuild
+      - name: Build semgrep-core
+        run: ./scripts/install-alpine-semgrep-core
+        env:
+          DUNE_CACHE: enabled
+          DUNE_CACHE_STORAGE_MODE: copy
+          DUNE_CACHE_ROOT: /home/user/.dune
+          DUNE_CACHE_TRANSPORT: direct
+      - name: Test semgrep-core
         run: |
           eval $(opam env)
           cd semgrep-core
@@ -48,8 +203,7 @@ jobs:
           curl --fail -L -X POST "https://dashboard.semgrep.dev/api/metric/semgrep.core.test-run-time-seconds.num" -d "$TEST_RUN_TIME"
       - name: Report Number of Tests Stats
         if: github.ref == 'refs/heads/develop'
-        run: |
-          ./semgrep-core/tests/report_test_metrics.sh
+        run: ./semgrep-core/tests/report_test_metrics.sh
 
       # TODO: move this to a stable host for more reliable results.
       #
@@ -65,188 +219,285 @@ jobs:
           #
           opam exec -- make -C semgrep-core report-perf
 
-  tox-tests:
-    name: semgrep tests with different python envs
+  test-cli:
+    name: test semgrep-cli
     runs-on: ubuntu-latest
     needs: [build-core]
+    permissions:
+      contents: write
+      pull-requests: write
     strategy:
       matrix:
-        python: [3.6, 3.7, 3.8, 3.9]
+        python: ["3.7", "3.8", "3.9", "3.10"]
     steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
       - name: Setup Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python }}
-      - name: Checkout
-        uses: actions/checkout@v2
+          cache: pipenv
+      - name: Install pipenv
+        run: pip install pipenv==2022.6.7
       - name: Download artifacts
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v3
         with:
           name: ocaml-build-artifacts
       - name: Install artifacts
         run: |
-          tar xf ocaml-build-artifacts/ocaml-build-artifacts.tgz
+          tar xf ocaml-build-artifacts.tgz
           sudo cp ocaml-build-artifacts/bin/* /usr/bin
-      - name: Test semgrep-core
-        run: semgrep-core -version
-      - name: Install Tox and any other packages
-        run: pip install pipenv==2018.11.26 tox==3.15.0
-      - name: Run Tox
-        env:
-          SEMGREP_SKIP_BIN: true
+      - name: Install Python dependencies
+        working-directory: cli
+        run: pipenv install --dev
+      - name: Run pytest
+        working-directory: cli
         run: |
-          cd semgrep
-          # See tox.ini for pytest command being run
-          tox -e py  # Run tox using the version of Python in `PATH`
+          # tests should simulate CI environment iff they need one
+          unset CI
+          unset "${!GITHUB_@}"
 
-  build-test:
-    name: semgrep unit and e2e tests
+          pipenv run pytest -n auto -vv --snapshot-update --allow-snapshot-deletion
+      # because of the fail-fast setting, we expect only the fastest failing job to get to the steps below
+      - name: Prepare repo for snapshot commit
+        if: failure()
+        run: |
+          # the commit step that follows will fail to fetch the pfff submodule
+          # (perhaps because of the github token's permissions)
+          # so we disable recursive fetching
+          git config fetch.recurseSubmodules false
+      - name: Commit snapshot updates
+        id: snapshot-commit
+        if: failure() && github.event_name == 'pull_request' && (github.actor != 'dependabot[bot]' && !(github.event.pull_request.head.repo.full_name != github.repository))
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: cli/tests/e2e/snapshots
+          default_author: github_actions
+          message: "Update pytest snapshots"
+          new_branch: snapshot-updates-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Comment about any snapshot updates
+        if: failure() && steps.snapshot-commit.outputs.pushed == 'true'
+        run: |
+          echo ":camera_flash: The pytest shapshots changed in your PR." >> /tmp/message.txt
+          echo "Please carefully review these changes and make sure they are intended:" >> /tmp/message.txt
+          echo >> /tmp/message.txt
+          echo "1. Review the changes at https://github.com/returntocorp/semgrep/commit/${{ steps.snapshot-commit.outputs.commit_long_sha }}" >> /tmp/message.txt
+          echo "2. Accept the new snapshots with" >> /tmp/message.txt
+          echo >> /tmp/message.txt
+          echo "       git fetch origin && git cherry-pick ${{ steps.snapshot-commit.outputs.commit_sha }} && git push" >> /tmp/message.txt
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/message.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test-qa:
+    name: quality assurance on semgrep
     runs-on: ubuntu-latest
     needs: [build-core]
     strategy:
+      fail-fast: false
       matrix:
-        python: [3.7]
+        split: [1, 2, 3, 4]
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          submodules: true
+        uses: actions/checkout@v3
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
       - name: Setup Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v4
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.10"
+          cache: pipenv
+      - name: Install pipenv
+        run: pip install pipenv==2022.6.7
       - name: Download artifacts
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v3
         with:
           name: ocaml-build-artifacts
       - name: Install artifacts
         run: |
-          tar xf ocaml-build-artifacts/ocaml-build-artifacts.tgz
+          tar xf ocaml-build-artifacts.tgz
           sudo cp ocaml-build-artifacts/bin/* /usr/bin
       - name: Install semgrep
+        working-directory: cli
         run: |
-          cd semgrep
           export PATH=/github/home/.local/bin:$PATH
-          pip3 install pipenv
           pipenv install --dev
-      - name: Test semgrep
-        run: |
-          cd semgrep
-          export PATH=/github/home/.local/bin:$PATH
-          pipenv run pytest --ignore=tests/qa/test_public_repos.py -n auto -vv --tb=short --durations=0 tests/
-      - name: Generate test matrix data
-        run: |
-          cd semgrep
-          pipenv run ../scripts/generate_test_matrix.py --json --directory ../semgrep-core/tests/ --output-file test-matrix.json
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v1
+      - uses: actions/cache@v3
         with:
-          name: test-matrix
-          path: semgrep/test-matrix.json
+          path: ~/.cache/qa-public-repos
+          key: qa-public-repos-${{ hashFiles('semgrep/tests/qa/*public_repos*') }}-${{ matrix.split }}
+      - run: |
+          mkdir -p ~/.cache/qa-public-repos
+          touch ~/.cache/qa-public-repos/ok
+      - name: Test semgrep
+        working-directory: cli
+        run: |
+          export PATH=/github/home/.local/bin:$PATH
+          pipenv run pytest -n auto -vv --tb=short --splits 4 --group ${{ matrix.split }} tests/qa
+        env:
+          QA_TESTS_CACHE_PATH: ~/.cache/qa-public-repos
 
-  public-repos-test:
-    name: run semgrep on public repos
+  # Run abbreviated version of benchmarks to check that they work
+  benchmarks-lite:
+    name: benchmarks (lite)
     runs-on: ubuntu-latest
     needs: [build-core]
-    strategy:
-      matrix:
-        python: [3.7]
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          submodules: true
+        uses: actions/checkout@v3
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
       - name: Setup Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v4
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.7"
+          cache: pipenv
+      - name: Install pipenv
+        run: pip install pipenv==2022.6.7
       - name: Download artifacts
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v3
         with:
           name: ocaml-build-artifacts
       - name: Install artifacts
         run: |
-          tar xf ocaml-build-artifacts/ocaml-build-artifacts.tgz
+          tar xf ocaml-build-artifacts.tgz
           sudo cp ocaml-build-artifacts/bin/* /usr/bin
       - name: Install semgrep
+        working-directory: cli
+        run: pipenv install --dev
+      - name: Test dummy benchmarks on latest
+        working-directory: cli
         run: |
-          cd semgrep
-          export PATH=/github/home/.local/bin:$PATH
-          pip3 install pipenv
-          pipenv install --dev
-      - uses: actions/cache@v2
-        with:
-          path: ~/.cache/semgrep-cache
-          key: semgrep-repo-cache-test
-      - name: create cache dir if not exists
-        run: mkdir -p ~/.cache/semgrep-cache
-      - run: touch ~/.cache/semgrep-cache/ok
-      - name: Test semgrep
-        run: |
-          cd semgrep
-          export PATH=/github/home/.local/bin:$PATH
-          pipenv run pytest -n auto -vv --tb=short --durations=0 tests/qa/test_public_repos.py
-        env:
-          GITHUB_REPO_CACHE: ~/.cache/semgrep-cache
+          pipenv run semgrep --version
+          pipenv run python -m semgrep --version
+          pipenv run semgrep-core -version
+          pipenv run python3 ../perf/run-benchmarks --dummy
 
   # Run each benchmark twice to decrease effect of natural variance
-  benchmark-test:
-    name: semgrep benchmark tests
+  benchmarks-full:
+    name: benchmarks (full)
     runs-on: ubuntu-latest
     needs: [build-core]
-    strategy:
-      matrix:
-        python: [3.7]
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          submodules: true
+        uses: actions/checkout@v3
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
       - name: Setup Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v4
         with:
-          python-version: ${{ matrix.python }}
-      - name: Run 0.65.0 Timing Benchmark
+          python-version: "3.7"
+          cache: pipenv
+      - name: Install pipenv
+        run: pip install pipenv==2022.6.7
+      - name: Run timing benchmark
         run: |
-          pip3 install semgrep==0.65.0
+          pip3 install semgrep==0.94.0
           semgrep --version
           python3 -m semgrep --version
           export PATH=/github/home/.local/bin:$PATH
 
-          python3 perf/run-benchmarks --small-only --std-only --save-to semgrep/baseline_timing1.json --no-time
-          jq . semgrep/baseline_timing1.json
-          python3 perf/run-benchmarks --small-only --std-only --save-to semgrep/baseline_timing2.json --no-time
-          jq . semgrep/baseline_timing2.json
+          python3 perf/run-benchmarks --small-only --std-only --save-to cli/baseline_timing1.json --no-time
+          jq . cli/baseline_timing1.json
+          python3 perf/run-benchmarks --small-only --std-only --save-to cli/baseline_timing2.json --no-time
+          jq . cli/baseline_timing2.json
           pip3 uninstall -y semgrep
       - name: Download artifacts
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v3
         with:
           name: ocaml-build-artifacts
       - name: Install artifacts
         run: |
-          tar xf ocaml-build-artifacts/ocaml-build-artifacts.tgz
+          tar xf ocaml-build-artifacts.tgz
           sudo cp ocaml-build-artifacts/bin/* /usr/bin
       - name: Install semgrep
-        run: |
-          cd semgrep
-          pip3 install pipenv
-          pipenv install --dev
-      - name: Test dummy benchmarks in docker from run-benchmarks
-        # This uploads the results, which should happen elsewhere so we run it explicitly for now.
-        #  make dummy
-        run: |
-          docker pull returntocorp/semgrep-dev:develop
-          python3 perf/run-benchmarks --docker returntocorp/semgrep-dev:develop --dummy
+        working-directory: cli
+        run: pipenv install --dev
       - name: Get timing for latest semgrep
+        working-directory: cli
         run: |
-          cd semgrep
           pipenv run semgrep --version
           pipenv run python -m semgrep --version
           pipenv run semgrep-core -version
           pipenv run python3 ../perf/run-benchmarks --small-only --std-only --save-to timing1.json
           jq . timing1.json
-          pipenv run python3 ../perf/run-benchmarks --small-only --std-only --save-to timing2.json
+          pipenv run python3 ../perf/run-benchmarks --small-only --std-only --save-to timing2.json --save-findings-to findings.json
           jq . timing2.json
+          jq . findings.json
       - name: Compare timing infos
         run: |
-          ./scripts/compare-perf semgrep/baseline_timing1.json semgrep/baseline_timing2.json semgrep/timing1.json semgrep/timing2.json ${{ secrets.GITHUB_TOKEN }} ${{ github.event.number }}
+          perf/compare-perf cli/baseline_timing1.json cli/baseline_timing2.json cli/timing1.json cli/timing2.json ${{ secrets.GITHUB_TOKEN }} ${{ github.event.number }}
+          perf/compare-bench-findings cli/findings.json
+
+  build-macos-release:
+    name: build macOS release
+    runs-on: macos-10.15
+    # there are too many PR events which deplete our macOS concurrency limit
+    if: (!contains(github.event_name, 'pull_request')) || contains(github.event.pull_request.head.ref, 'release-')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+      - name: Install pipenv
+        run: sudo python3 -m pip install pipenv
+      - name: Run OSX build
+        run: ./scripts/osx-release.sh
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: semgrep-osx
+          path: artifacts
+
+  test-macos-release:
+    name: test macOS release
+    runs-on: macos-10.15
+    # there are too many PR events which deplete our macOS concurrency limit
+    if: (!contains(github.event_name, 'pull_request')) || contains(github.event.pull_request.head.ref, 'release-')
+    needs: [build-macos-release]
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: semgrep-osx
+          path: artifacts
+      - name: Remove pcre dynamic lib
+        run: rm /usr/local/opt/pcre/lib/libpcre.1.dylib
+      - name: test build artifacts
+        run: |
+          chmod +x ./artifacts/semgrep-core
+          ./artifacts/semgrep-core -help
+
+  build-ubuntu:
+    name: build Ubuntu release
+    needs: [build-core]
+    runs-on: ubuntu-latest
+    container: returntocorp/sgrep-build:ubuntu-16.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Fetch semgrep-cli submodules
+        run: git submodule update --init --recursive --recommend-shallow cli/src/semgrep/lang cli/src/semgrep/semgrep_interfaces
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ocaml-build-artifacts
+      - name: Install artifacts
+        run: |
+          tar xf ocaml-build-artifacts.tgz
+          mkdir -p semgrep-files
+          cp ocaml-build-artifacts/bin/* semgrep-files
+      - name: Run Ubuntu build script
+        run: ./scripts/ubuntu-release.sh
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: semgrep-ubuntu-16.04-${{ github.sha }}
+          path: artifacts.tar.gz

@@ -1,15 +1,16 @@
 (* David Frankel
  *
- * Copyright (c) 2021 ??
+ * Copyright (c) 2021 R2C
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License (GPL)
- * version 2 as published by the Free Software Foundation.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * version 2.1 as published by the Free Software Foundation, with the
+ * special exception on linking described in file license.txt.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * file license.txt for more details.
+ * This library is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
+ * license.txt for more details.
  *)
 (*
    Map a Hack CST obtained from the tree-sitter parser directly to the generic
@@ -24,21 +25,18 @@ module G = AST_generic
 module CST = Tree_sitter_hack.CST
 module H = Parse_tree_sitter_helpers
 module PI = Parse_info
+module H2 = AST_generic_helpers
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
 
 type mode = Pattern | Target
-
 type env = mode H.env
 
 let logger = Logging.get_logger [ __MODULE__ ]
-
 let token = H.token
-
 let str = H.str
-
 let fk tok = Parse_info.fake_info tok ""
 
 (* Remove this function when everything is done *)
@@ -48,48 +46,13 @@ let todo (_env : env) _ = failwith "not implemented"
 
 (* Below are manual additions.
    There are more helpers in AST_generic.ml and AST_generic_helpers.ml.
- *)
+*)
 
 let empty_stmt env t =
   let t = token env t (* ";" *) in
   G.Block (t, [], t) |> G.s
 
 let todo_deprecation_stmt = G.Block (G.fake_bracket [])
-
-let unwrap_qualified_identifier qual =
-  match qual with
-  | G.Id (ident, _id_info) -> [ ident ]
-  (* Unwrap all existing identifiers *)
-  | IdQualified ((ident, name_info), _id_info) ->
-      let name_info = name_info.name_qualifier in
-      let idents =
-        match name_info with
-        | Some (QDots dotted_ident) -> dotted_ident @ [ ident ]
-        | _ -> raise Impossible
-      in
-      idents
-
-let add_type_args_to_name name type_args =
-  match name with
-  | G.Id (ident, id_info) ->
-      (* Only IdQualified supports typeargs *)
-      G.IdQualified
-        ((ident, { name_qualifier = None; name_typeargs = type_args }), id_info)
-  | IdQualified ((ident, name_info), id_info) -> (
-      match name_info.name_typeargs with
-      | Some _x ->
-          IdQualified ((ident, name_info), id_info)
-          (* TODO: Enable raise Impossible *)
-          (* raise Impossible *)
-          (* Never should have to overwrite type args, but also doesn't make sense to merge *)
-      | None ->
-          G.IdQualified
-            ( ( ident,
-                {
-                  name_qualifier = name_info.name_qualifier;
-                  name_typeargs = type_args;
-                } ),
-              id_info ))
 
 let basic_typed_entity id attrs tparams : G.entity =
   G.basic_entity id ~attrs ~tparams
@@ -208,7 +171,7 @@ let xhp_category_declaration (env : env)
     (* pattern %[a-zA-Z_][a-zA-Z0-9_]*([-:][a-zA-Z0-9_]+)* *) str env v2
   in
   let _v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 =
@@ -222,7 +185,8 @@ let xhp_category_declaration (env : env)
      THIS DOES NOTHING *)
   todo_deprecation_stmt
 
-let qualified_identifier (env : env) (x : CST.qualified_identifier) : G.name =
+let qualified_identifier (env : env) (x : CST.qualified_identifier) :
+    G.dotted_ident =
   match x with
   | `Choice_opt_id_rep1_back_id x -> (
       match x with
@@ -235,7 +199,7 @@ let qualified_identifier (env : env) (x : CST.qualified_identifier) : G.name =
             | None -> []
           in
           let v2 =
-            List.map
+            Common.map
               (fun (v1, v2) ->
                 let _v1 = (* "\\" *) token env v1 in
                 let v2 =
@@ -245,20 +209,12 @@ let qualified_identifier (env : env) (x : CST.qualified_identifier) : G.name =
                 v2)
               v2
           in
-          (* Q: Is it fine to ignore if the name is fully vs partially qualified? *)
-          let ids = List.rev (v1 @ v2) in
-          (* These lists must not be empty so we shouldn't crash here *)
-          let ident = List.hd ids in
-          let qual = G.QDots (List.rev (List.tl ids)) in
-          G.IdQualified
-            ( (ident, { name_qualifier = Some qual; name_typeargs = None }),
-              G.empty_id_info () )
+          v1 @ v2
       | `Id tok ->
           (* pattern [a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]* *)
           let ident = str env tok in
-          Id (ident, G.empty_id_info ()))
-  | `Semg_id tok ->
-      (* pattern \$[A-Z_][A-Z_0-9]* *) Id (str env tok, G.empty_id_info ())
+          [ ident ])
+  | `Semg_id tok -> (* pattern \$[A-Z_][A-Z_0-9]* *) [ str env tok ]
 
 let empty_statement (env : env) (x : CST.empty_statement) =
   match x with
@@ -311,7 +267,7 @@ let rec xhp_attribute_expression (env : env) (x : CST.xhp_attribute_expression)
       let v1 = (* "(" *) token env v1 in
       let v2 = xhp_attribute_expression env v2 in
       let v3 =
-        List.map
+        Common.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = xhp_attribute_expression env v2 in
@@ -377,11 +333,13 @@ let namespace_identifier (env : env) (x : CST.namespace_identifier) =
         | None -> None
       in
       Some v1
+  (* TODO? QTop? *)
   | `Back _tok -> (* "\\" *) None
 
 (* token env tok *)
 
-let rec type_constant_ (env : env) ((v1, v2, v3) : CST.type_constant_) =
+let rec type_constant_ (env : env) ((v1, v2, v3) : CST.type_constant_) :
+    G.dotted_ident =
   let v1 =
     match v1 with
     | `Qual_id x -> qualified_identifier env x
@@ -389,10 +347,7 @@ let rec type_constant_ (env : env) ((v1, v2, v3) : CST.type_constant_) =
   in
   let _v2 = (* "::" *) token env v2 in
   let v3 = (* pattern [a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]* *) str env v3 in
-  let qual = G.QDots (unwrap_qualified_identifier v1) in
-  G.IdQualified
-    ( (v3, { name_qualifier = Some qual; name_typeargs = None }),
-      G.empty_id_info () )
+  v1 @ [ v3 ]
 
 let trait_select_clause (env : env)
     ((v1, v2, v3, v4, v5, v6) : CST.trait_select_clause) =
@@ -404,7 +359,7 @@ let trait_select_clause (env : env)
   let v4 = (* "insteadof" *) token env v4 in
   let v5 = qualified_identifier env v5 in
   let v6 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let v1 = (* "," *) token env v1 in
         let v2 = qualified_identifier env v2 in
@@ -424,7 +379,7 @@ let _xhp_children_declaration (env : env)
   let _v1 = (* "children" *) token env v1 in
   let _v2TODO = xhp_attribute_expression env v2 in
   let _v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = xhp_attribute_expression env v2 in
@@ -448,11 +403,11 @@ let keyword (env : env) (x : CST.keyword) =
 
 let xhp_enum_type (env : env) ((v1, v2, v3, v4, v5, v6) : CST.xhp_enum_type)
     ident =
-  let _v1 = (* "enum" *) str env v1 in
+  let v1 = (* "enum" *) token env v1 in
   let _v2 = (* "{" *) token env v2 in
   let v3 = G.OrEnum (xhp_enum_key env v3, None) in
   let v4 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = G.OrEnum (xhp_enum_key env v2, None) in
@@ -472,14 +427,13 @@ let xhp_enum_type (env : env) ((v1, v2, v3, v4, v5, v6) : CST.xhp_enum_type)
     G.DefStmt (G.basic_entity ident, TypeDef { tbody = OrType (v3 :: v4) })
     |> G.s
   in
-  G.OtherType (OT_Expr, [ G.S def ]) |> G.t
+  G.OtherType (("EnumAnon", v1), [ G.S def ]) |> G.t
 
-let scoped_identifier (env : env) ((v1, v2, v3) : CST.scoped_identifier) =
+let scoped_identifier (env : env) ((v1, v2, v3) : CST.scoped_identifier) :
+    G.dotted_ident =
   let v1 =
     match v1 with
-    | `Qual_id x ->
-        let qual = qualified_identifier env x in
-        unwrap_qualified_identifier qual
+    | `Qual_id x -> qualified_identifier env x
     | `Var tok -> (* variable *) [ str env tok ]
     | `Scope_id x ->
         (* Note: scope_identifier doesn't really work here because we need to unwrap *)
@@ -499,10 +453,7 @@ let scoped_identifier (env : env) ((v1, v2, v3) : CST.scoped_identifier) =
         (* pattern [a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]* *) str env tok
     | `Var tok -> (* variable *) str env tok
   in
-  let qual = G.QDots v1 in
-  G.IdQualified
-    ( (v3, { name_qualifier = Some qual; name_typeargs = None }),
-      G.empty_id_info () )
+  v1 @ [ v3 ]
 
 let _anonymous_function_use_clause (env : env)
     ((v1, v2, v3, v4, v5, v6) : CST.anonymous_function_use_clause) =
@@ -510,7 +461,7 @@ let _anonymous_function_use_clause (env : env)
   let v2 = (* "(" *) token env v2 in
   let v3 = (* variable *) token env v3 in
   let v4 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let v1 = (* "," *) token env v1 in
         let v2 = (* variable *) token env v2 in
@@ -550,7 +501,7 @@ let use_clause (env : env) ((v1, v2, v3) : CST.use_clause) =
         | None -> None) *)
   in
   match namespace_ident with
-  | Some x -> (Some (unwrap_qualified_identifier x), v3)
+  | Some xs -> (Some xs, v3)
   | None -> (None, v3)
 
 let const_declarator_id (env : env) (x : CST.anon_choice_semg_exte_id_8bbc8de) =
@@ -579,7 +530,7 @@ and anon_choice_exp_rep_COMMA_choice_exp_opt_COMMA_e4364bb (env : env)
     =
   let v1 = anon_choice_exp_1701d0a env v1 in
   let v2 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = anon_choice_exp_1701d0a env v2 in
@@ -622,7 +573,7 @@ and anon_exp_rep_COMMA_exp_0bb260c (env : env)
     ((v1, v2) : CST.anon_exp_rep_COMMA_exp_0bb260c) =
   let v1 = expression env v1 in
   let v2 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         (* Q: Change tree-sitter to be less permissive in what's allowed here? *)
@@ -657,7 +608,7 @@ and arguments (env : env) ((v1, v2, v3) : CST.arguments) : G.arguments =
     | Some (v1, v2, v3) ->
         let v1 = argument env v1 in
         let v2 =
-          List.map
+          Common.map
             (fun (v1, v2) ->
               let _v1 = (* "," *) token env v1 in
               let v2 = argument env v2 in
@@ -696,9 +647,10 @@ and attribute_modifier (env : env)
     | Some x -> arguments env x
     | None -> G.fake_bracket []
   in
-  let attr1 = G.NamedAttr (v1, v2, v3) in
+  let n = H2.name_of_ids v2 in
+  let attr1 = G.NamedAttr (v1, n, v3) in
   let v4 =
-    List.map
+    Common.map
       (fun (v1, v2, v3) ->
         let v1 = (* "," *) token env v1 in
         let v2 = qualified_identifier env v2 in
@@ -707,7 +659,8 @@ and attribute_modifier (env : env)
           | Some x -> arguments env x
           | None -> G.fake_bracket []
         in
-        G.NamedAttr (v1, v2, v3))
+        let n = H2.name_of_ids v2 in
+        G.NamedAttr (v1, n, v3))
       v4
   in
   let _v5 =
@@ -1028,16 +981,15 @@ and catch_clause (env : env) ((v1, v2, v3, v4, v5, v6) : CST.catch_clause) =
   let v1 = (* "catch" *) token env v1 in
   let _v2 = (* "(" *) token env v2 in
   let v3 = type_ env v3 in
-  let v4 = (* variable *) Some (str env v4, G.empty_id_info ()) in
+  let v4 = (* variable *) Some (str env v4) in
   let _v5 = (* ")" *) token env v5 in
   let v6 = compound_statement env v6 in
-  (* Q: PatTyped vs PVal? *)
-  let pattern = G.PatVar (v3, v4) in
-  (v1, pattern, v6)
+  let exn = G.CatchParam (G.param_of_type v3 ~pname:v4) in
+  (v1, exn, v6)
 
 and class_const_declaration (env : env)
     ((v1, v2, v3, v4, v5, v6) : CST.class_const_declaration) =
-  let v1 = List.map (member_modifier env) v1 in
+  let v1 = Common.map (member_modifier env) v1 in
   let v2 = (* "const" *) [ G.KeywordAttr (Const, token env v2) ] in
   let attrs = v1 @ v2 in
   let type_ =
@@ -1046,12 +998,12 @@ and class_const_declaration (env : env)
     | None -> None
   in
   let _v6 = (* ";" *) token env v6 in
-  let v4 = G.FieldStmt (class_const_declarator env v4 attrs type_) in
+  let v4 = G.F (class_const_declarator env v4 attrs type_) in
   let v5 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
-        let v2 = G.FieldStmt (class_const_declarator env v2 attrs type_) in
+        let v2 = G.F (class_const_declarator env v2 attrs type_) in
         v2)
       v5
   in
@@ -1076,7 +1028,7 @@ and class_const_declarator (env : env) ((v1, v2) : CST.class_const_declarator)
 and compound_statement (env : env) ((v1, v2, v3) : CST.compound_statement) :
     G.stmt =
   let v1 = (* "{" *) token env v1 in
-  let v2 = List.map (statement env) v2 in
+  let v2 = Common.map (statement env) v2 in
   let v3 = (* "}" *) token env v3 in
   G.Block (v1, v2, v3) |> G.s
 
@@ -1296,7 +1248,7 @@ and declaration (env : env) (x : CST.declaration) =
         | None -> None
       in
       let _v7 = (* "{" *) token env v7 in
-      let v8 = List.map (enumerator env) v8 in
+      let v8 = Common.map (enumerator env) v8 in
       let _v9 = (* "}" *) token env v9 in
       G.DefStmt (G.basic_entity v3 ~attrs:v1, TypeDef { tbody = G.OrType v8 })
   | `Name_decl (v1, v2) -> (
@@ -1308,14 +1260,11 @@ and declaration (env : env) (x : CST.declaration) =
             | `Qual_id_SEMI (v1, v2) ->
                 let v1 = qualified_identifier env v1 in
                 let _v2 = (* ";" *) token env v2 in
-                Some (unwrap_qualified_identifier v1)
+                Some v1
             | `Opt_qual_id_comp_stmt (v1, v2) ->
                 let v1 =
                   match v1 with
-                  | Some x ->
-                      Some
-                        (qualified_identifier env x
-                       |> unwrap_qualified_identifier)
+                  | Some x -> Some (qualified_identifier env x)
                   | None -> None
                 in
                 (* TODO: Handle namespace with block inside *)
@@ -1336,7 +1285,7 @@ and declaration (env : env) (x : CST.declaration) =
       in
       let v3 = const_declarator env v3 attr type_ |> G.s in
       let v4 =
-        List.map
+        Common.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = const_declarator env v2 attr type_ |> G.s in
@@ -1370,7 +1319,7 @@ and embedded_brace_expression_ (env : env) (x : CST.embedded_brace_expression_)
       let v3 =
         match v3 with
         | Some x -> expression env x
-        | None -> G.OtherExpr (OE_ArrayAppend, []) |> G.e
+        | None -> G.OtherExpr (("ArrayAppend", v2), []) |> G.e
       in
       let v4 = (* "]" *) token env v4 in
       G.ArrayAccess (v1, (v2, v3, v4)) |> G.e
@@ -1384,7 +1333,7 @@ and embedded_brace_expression_ (env : env) (x : CST.embedded_brace_expression_)
          See dots_method_chaining.hack *)
       match v3.e with
       | G.Ellipsis dots -> G.DotAccessEllipsis (v1, dots) |> G.e
-      | _ -> G.DotAccess (v1, v2, G.EDynamic v3) |> G.e)
+      | _ -> G.DotAccess (v1, v2, G.FDynamic v3) |> G.e)
 
 and enumerator (env : env) ((v1, v2, v3, v4) : CST.enumerator) =
   let v1 = semgrep_extended_identifier env v1 in
@@ -1408,7 +1357,7 @@ and expression (env : env) (x : CST.expression) : G.expr =
             | None -> v2
           in
           let v4 =
-            List.map
+            Common.map
               (fun x ->
                 G.Arg
                   (match x with
@@ -1465,7 +1414,7 @@ and expression (env : env) (x : CST.expression) : G.expr =
             | Some (v1, v2, v3) ->
                 let v1 = expression env v1 in
                 let v2 =
-                  List.map
+                  Common.map
                     (fun (v1, v2) ->
                       let _v1 = (* "," *) token env v1 in
                       let v2 = expression env v2 in
@@ -1489,12 +1438,12 @@ and expression (env : env) (x : CST.expression) : G.expr =
           let v3 =
             match v3 with
             | Some (v1, v2, v3) ->
-                let v1 = G.FieldStmt (field_initializer env v1 |> G.s) in
+                let v1 = G.F (field_initializer env v1 |> G.s) in
                 let v2 =
-                  List.map
+                  Common.map
                     (fun (v1, v2) ->
                       let _v1 = (* "," *) token env v1 in
-                      let v2 = G.FieldStmt (field_initializer env v2 |> G.s) in
+                      let v2 = G.F (field_initializer env v2 |> G.s) in
                       v2)
                     v2
                 in
@@ -1562,14 +1511,9 @@ and expression (env : env) (x : CST.expression) : G.expr =
           (* This is awaitable block, not just await keyword *)
           (* Q: How to handle this and concurrent? *)
           let _v1TODO = (* "async" *) token env v1 in
-          let v2 =
-            G.OtherExpr (OE_StmtExpr, [ G.S (compound_statement env v2) ])
-            |> G.e
-          in
+          let v2 = G.stmt_to_expr (compound_statement env v2) in
           (* TODO: This can't possibly be right *)
-          G.OtherExpr
-            (OE_StmtExpr, [ G.S (G.OtherStmt (OS_Async, [ G.E v2 ]) |> G.s) ])
-          |> G.e
+          G.stmt_to_expr (G.OtherStmt (OS_Async, [ G.E v2 ]) |> G.s)
       | `Yield_exp (v1, v2) ->
           let v1 = (* "yield" *) token env v1 in
           let v2 = anon_choice_exp_1701d0a env v2 in
@@ -1580,15 +1524,15 @@ and expression (env : env) (x : CST.expression) : G.expr =
           let v1 = (* "(" *) token env v1 in
           let v2 =
             match v2 with
-            | `Array tok -> (* "array" *) G.TyBuiltin (str env tok)
-            | `Int tok -> (* "int" *) G.TyBuiltin (str env tok)
-            | `Float tok -> (* "float" *) G.TyBuiltin (str env tok)
-            | `Str tok -> (* "string" *) G.TyBuiltin (str env tok)
-            | `Bool tok -> (* "bool" *) G.TyBuiltin (str env tok)
+            | `Array tok -> (* "array" *) G.ty_builtin (str env tok)
+            | `Int tok -> (* "int" *) G.ty_builtin (str env tok)
+            | `Float tok -> (* "float" *) G.ty_builtin (str env tok)
+            | `Str tok -> (* "string" *) G.ty_builtin (str env tok)
+            | `Bool tok -> (* "bool" *) G.ty_builtin (str env tok)
           in
           let _v3 = (* ")" *) token env v3 in
           let v4 = expression env v4 in
-          G.Cast (v2 |> G.t, v1, v4) |> G.e
+          G.Cast (v2, v1, v4) |> G.e
       | `Tern_exp (v1, v2, v3, v4, v5) ->
           let v1 = expression env v1 in
           let _v2 = (* "?" *) token env v2 in
@@ -1612,7 +1556,7 @@ and expression (env : env) (x : CST.expression) : G.expr =
             match v3 with
             | `Single_param_params tok ->
                 (* variable *)
-                ([ G.ParamClassic (G.param_of_id (str env tok)) ], None)
+                ([ G.Param (G.param_of_id (str env tok)) ], None)
             | `Params_opt_COLON_choice_type_spec (v1, v2) ->
                 let v1 = parameters env v1 in
                 let v2 =
@@ -1644,15 +1588,15 @@ and expression (env : env) (x : CST.expression) : G.expr =
       | `Call_exp x -> call_expression env x
       | `Sele_exp x -> selection_expression env x
       | `New_exp (v1, v2, v3, v4) ->
-          let v1 = (* "new" *) token env v1 in
-          let v2 = G.fake_bracket [ G.Arg (variablish env v2) ] in
+          let tnew = (* "new" *) token env v1 in
+          let ty = H2.expr_to_type (variablish env v2) in
           let _v3TODO =
             match v3 with
             | Some x -> type_arguments env x
             | None -> None
           in
           let v4 = arguments env v4 in
-          G.Call (G.Call (G.IdSpecial (New, v1) |> G.e, v2) |> G.e, v4) |> G.e
+          G.New (tnew, ty, v4) |> G.e
       | `Incl_exp (v1, v2) ->
           (* Q: See question below in Requ *)
           let v1 =
@@ -1661,7 +1605,7 @@ and expression (env : env) (x : CST.expression) : G.expr =
             | `Incl_once tok -> (* "include_once" *) str env tok
           in
           let v2 = expression env v2 in
-          G.OtherExpr (G.OE_Require, [ G.TodoK v1; G.E v2 ]) |> G.e
+          G.OtherExpr (v1, [ G.E v2 ]) |> G.e
       | `Requ_exp (v1, v2) ->
           (* Q: What makes this an expression and not a directive statement? *)
           let v1 =
@@ -1670,7 +1614,7 @@ and expression (env : env) (x : CST.expression) : G.expr =
             | `Requ_once tok -> (* "require_once" *) str env tok
           in
           let v2 = expression env v2 in
-          G.OtherExpr (G.OE_Require, [ G.TodoK v1; G.E v2 ]) |> G.e
+          G.OtherExpr (v1, [ G.E v2 ]) |> G.e
       | `Anon_func_exp (v1, v2, v3, v4, v5, v6) ->
           (* TODO: Anon is not the same as Lambda. These are PHP style. *)
           let _v1TODO =
@@ -1723,21 +1667,22 @@ and extends_clause (env : env) ((v1, v2, v3) : CST.extends_clause) :
   let _v1 = (* "extends" *) token env v1 in
   let v2 = type_ env v2 in
   let v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = type_ env v2 in
         v2)
       v3
   in
-  v2 :: v3 |> List.map (fun ty -> (ty, None))
+  v2 :: v3 |> Common.map (fun ty -> (ty, None))
 
 and field_initializer (env : env) ((v1, v2, v3) : CST.field_initializer) =
   let v1 =
     match v1 with
     | `Str tok -> (* string *) G.basic_entity (str env tok)
     | `Scoped_id x ->
-        { name = G.EN (scoped_identifier env x); attrs = []; tparams = [] }
+        let x = scoped_identifier env x in
+        { name = G.EN (H2.name_of_ids x); attrs = []; tparams = [] }
   in
   let _v2 = (* "=>" *) token env v2 in
   let v3 = expression env v3 in
@@ -1804,7 +1749,7 @@ and implements_clause (env : env) ((v1, v2, v3) : CST.implements_clause) =
   let _v1 = (* "implements" *) token env v1 in
   let v2 = type_ env v2 in
   let v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = type_ env v2 in
@@ -1816,31 +1761,29 @@ and implements_clause (env : env) ((v1, v2, v3) : CST.implements_clause) =
 and member_declarations (env : env) ((v1, v2, v3) : CST.member_declarations) =
   let v1 = (* "{" *) token env v1 in
   let v2 =
-    List.map
+    Common.map
       (fun x ->
         match x with
         | `Class_const_decl x -> class_const_declaration env x
-        | `Meth_decl x -> [ G.FieldStmt (method_declaration env x |> G.s) ]
+        | `Meth_decl x -> [ G.F (method_declaration env x |> G.s) ]
         | `Prop_decl x -> property_declaration env x
-        | `Type_const_decl x -> [ G.FieldStmt (type_const_declaration env x) ]
+        | `Type_const_decl x -> [ G.F (type_const_declaration env x) ]
         (* TODO: Add Trait use support *)
         | `Trait_use_clause _xTODO ->
             [ (*  G.FieldStmt (trait_use_clause env x |> G.s) *) ]
         | `Requ_imples_clause x ->
-            [ G.FieldStmt (require_implements_clause env x |> G.s) ]
+            [ G.F (require_implements_clause env x |> G.s) ]
         | `Requ_extends_clause x ->
-            [ G.FieldStmt (require_extends_clause env x |> G.s) ]
+            [ G.F (require_extends_clause env x |> G.s) ]
         | `Xhp_attr_decl x -> xhp_attribute_declaration env x
         | `Xhp_chil_decl _xTODO ->
             (* TODO: Figure out what this even is *)
             [ (* G.FieldStmt (xhp_children_declaration env x |> G.s) *) ]
-        | `Xhp_cate_decl x ->
-            [ G.FieldStmt (xhp_category_declaration env x |> G.s) ]
+        | `Xhp_cate_decl x -> [ G.F (xhp_category_declaration env x |> G.s) ]
         | `Ellips tok ->
             let tok = token env tok in
             (* "..." *)
-            let expr = G.ExprStmt (G.Ellipsis tok |> G.e, fk tok) |> G.s in
-            [ G.FieldStmt expr ])
+            [ G.fieldEllipsis tok ])
       v2
   in
   let v3 = (* "}" *) token env v3 in
@@ -1852,7 +1795,7 @@ and method_declaration (env : env) ((v1, v2, v3, v4) : CST.method_declaration) =
     | Some x -> attribute_modifier env x
     | None -> []
   in
-  let v2 = List.map (member_modifier env) v2 in
+  let v2 = Common.map (member_modifier env) v2 in
   let func_def, identifier, type_args = function_declaration_header env v3 in
   let v4 = inline_compound_statement env v4 in
   let def = { func_def with fbody = G.FBStmt v4 } in
@@ -1905,13 +1848,13 @@ and parameter (env : env) (x : CST.parameter) : G.parameter =
           pdefault = v7;
           pattrs = v1 @ v2 @ v3;
           pinfo =
-            G.basic_id_info (Param, G.sid_TODO)
+            G.basic_id_info (Parameter, G.sid_TODO)
             (* Q: But why sid_TODO? Like what is this info? *);
         }
       in
       match v5 with
       | Some tok -> (* "..." *) G.ParamRest (tok, param)
-      | None -> G.ParamClassic param)
+      | None -> G.Param param)
   | `Ellips tok -> (* "..." *) G.ParamEllipsis (token env tok)
 
 and parameters (env : env) ((v1, v2, v3) : CST.parameters) =
@@ -1937,7 +1880,7 @@ and parameters (env : env) ((v1, v2, v3) : CST.parameters) =
         | `Param_rep_COMMA_param_opt_COMMA (v1, v2, v3) ->
             let v1 = parameter env v1 in
             let v2 =
-              List.map
+              Common.map
                 (fun (v1, v2) ->
                   let _v1 = (* "," *) token env v1 in
                   let v2 = parameter env v2 in
@@ -2016,10 +1959,10 @@ and prefix_unary_expression (env : env) (x : CST.prefix_unary_expression) =
       G.Await (v1, v2) |> G.e
   | `AT_exp (v1, v2) ->
       (* Silences errors *)
-      let v1 = (* "@" *) str env v1 in
+      let v1 = (* "@" *) token env v1 in
       let v2 = expression env v2 in
       (* TODO: Is this good? *)
-      G.OtherExpr (OE_Todo, [ G.TodoK v1; G.E v2 ]) |> G.e
+      G.OtherExpr (("AtExpr", v1), [ G.E v2 ]) |> G.e
 
 and property_declaration (env : env)
     ((v1, v2, v3, v4, v5, v6) : CST.property_declaration) =
@@ -2028,19 +1971,19 @@ and property_declaration (env : env)
     | Some x -> attribute_modifier env x
     | None -> []
   in
-  let v2 = List.map (member_modifier env) v2 in
+  let v2 = Common.map (member_modifier env) v2 in
   let attrs = v1 @ v2 in
   let type_ =
     match v3 with
     | Some x -> Some (type_ env x)
     | None -> None
   in
-  let v4 = G.FieldStmt (property_declarator env v4 attrs type_) in
+  let v4 = G.F (property_declarator env v4 attrs type_) in
   let v5 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
-        let v2 = G.FieldStmt (property_declarator env v2 attrs type_) in
+        let v2 = G.F (property_declarator env v2 attrs type_) in
         v2)
       v5
   in
@@ -2068,7 +2011,7 @@ and require_extends_clause (env : env)
   let v2 = (* "extends" *) [ G.TodoK (str env v2) ] in
   let v3 = [ G.T (type_ env v3) ] in
   let v4 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = G.T (type_ env v2) in
@@ -2084,7 +2027,7 @@ and require_implements_clause (env : env)
   let v2 = (* "implements" *) [ G.TodoK (str env v2) ] in
   let v3 = [ G.T (type_ env v3) ] in
   let v4 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = G.T (type_ env v2) in
@@ -2109,7 +2052,7 @@ and selection_expression (env : env) ((v1, v2, v3) : CST.selection_expression) =
   in
   match v3.e with
   | G.Ellipsis dots -> G.DotAccessEllipsis (v1, dots) |> G.e
-  | _ -> G.DotAccess (v1, v2, G.EDynamic v3) |> G.e
+  | _ -> G.DotAccess (v1, v2, G.FDynamic v3) |> G.e
 
 and statement (env : env) (x : CST.statement) =
   match x with
@@ -2157,7 +2100,7 @@ and statement (env : env) (x : CST.statement) =
       let v1 = (* "echo" *) str env v1 in
       let v2 = G.Arg (expression env v2) in
       let v3 =
-        List.map
+        Common.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = G.Arg (expression env v2) in
@@ -2170,14 +2113,14 @@ and statement (env : env) (x : CST.statement) =
       G.ExprStmt (G.Call (G.N iden |> G.e, G.fake_bracket exprs) |> G.e, v4)
       |> G.s
   | `Unset_stmt (v1, v2, v3, v4, v5) ->
-      let _v1TODO = (* "unset" *) token env v1 in
+      let v1 = (* "unset" *) token env v1 in
       let _v2 = (* "(" *) token env v2 in
       let v3 =
         match v3 with
         | Some (v1, v2) ->
             let v1 = variablish env v1 in
             let v2 =
-              List.map
+              Common.map
                 (fun (v1, v2) ->
                   let _v1 = (* "," *) token env v1 in
                   let v2 = variablish env v2 in
@@ -2190,7 +2133,7 @@ and statement (env : env) (x : CST.statement) =
       let _v4 = (* ")" *) token env v4 in
       let v5 = (* ";" *) token env v5 in
       (* Q: Better to just use Call? *)
-      G.ExprStmt (G.OtherExpr (G.OE_Delete, v3) |> G.e, v5) |> G.s
+      G.ExprStmt (G.OtherExpr (("Unset", v1), v3) |> G.e, v5) |> G.s
   | `Use_stmt (v1, v2, v3) ->
       (* Q: What do comma seperated use statements mean? And how do they alias? *)
       let v1 = (* "use" *) token env v1 in
@@ -2211,7 +2154,7 @@ and statement (env : env) (x : CST.statement) =
         | `Use_clause_rep_COMMA_use_clause_opt_COMMA (v1, v2, v3) ->
             let v1 = create_directive (use_clause env v1) [] in
             let v2 =
-              List.map
+              Common.map
                 (fun (v1, v2) ->
                   let _v1 = (* "," *) token env v1 in
                   let v2 = use_clause env v2 in
@@ -2238,13 +2181,13 @@ and statement (env : env) (x : CST.statement) =
             let v2 = namespace_identifier env v2 in
             let ident_prefix =
               match v2 with
-              | Some x -> unwrap_qualified_identifier x
+              | Some x -> x
               | None -> []
             in
             let _v3 = (* "{" *) token env v3 in
             let v4 = create_directive (use_clause env v4) ident_prefix in
             let v5 =
-              List.map
+              Common.map
                 (fun (v1, v2) ->
                   let _v1 = (* "," *) token env v1 in
                   let v2 = use_clause env v2 in
@@ -2267,7 +2210,7 @@ and statement (env : env) (x : CST.statement) =
       let v3 = statement env v3 in
       (* Q: Should we be folding? Where does elif go? *)
       let v4 =
-        List.map
+        Common.map
           (fun (v1, v2, v3) ->
             let v1 =
               match v1 with
@@ -2279,7 +2222,7 @@ and statement (env : env) (x : CST.statement) =
             in
             let v2 = parenthesized_expression env v2 in
             let v3 = statement env v3 in
-            G.If (v1, v2, v3, None) |> G.s)
+            G.If (v1, G.Cond v2, v3, None) |> G.s)
           v4
       in
       let v5 =
@@ -2291,12 +2234,13 @@ and statement (env : env) (x : CST.statement) =
         | None -> []
       in
       (* TODO: Figure out if this is even a proper representation *)
-      G.If (v1, v2, v3, Some (G.Block (G.fake_bracket (v4 @ v5)) |> G.s)) |> G.s
+      G.If (v1, G.Cond v2, v3, Some (G.Block (G.fake_bracket (v4 @ v5)) |> G.s))
+      |> G.s
   | `While_stmt (v1, v2, v3) ->
       let v1 = (* "while" *) token env v1 in
       let v2 = parenthesized_expression env v2 in
       let v3 = statement env v3 in
-      G.While (v1, v2, v3) |> G.s
+      G.While (v1, G.Cond v2, v3) |> G.s
   | `Do_stmt (v1, v2, v3, v4, v5) ->
       let v1 = (* "do" *) token env v1 in
       let v2 = statement env v2 in
@@ -2312,7 +2256,7 @@ and statement (env : env) (x : CST.statement) =
         (* Q: Always use ForInitExpr since that is what we get back? *)
         | Some x ->
             let cast x = G.ForInitExpr x in
-            List.map cast (anon_exp_rep_COMMA_exp_0bb260c env x)
+            Common.map cast (anon_exp_rep_COMMA_exp_0bb260c env x)
         | None -> []
       in
       let _v4 = (* ";" *) token env v4 in
@@ -2335,10 +2279,10 @@ and statement (env : env) (x : CST.statement) =
       G.For (v1, header, v9) |> G.s
   | `Switch_stmt (v1, v2, v3, v4, v5) ->
       let v1 = (* "switch" *) token env v1 in
-      let v2 = Some (parenthesized_expression env v2) in
+      let v2 = Some (G.Cond (parenthesized_expression env v2)) in
       let _v3 = (* "{" *) token env v3 in
       let v4 =
-        List.map
+        Common.map
           (fun x ->
             match x with
             | `Switch_case x -> switch_case env x
@@ -2379,7 +2323,7 @@ and statement (env : env) (x : CST.statement) =
   | `Try_stmt (v1, v2, v3, v4) ->
       let v1 = (* "try" *) token env v1 in
       let v2 = compound_statement env v2 in
-      let v3 = List.map (catch_clause env) v3 in
+      let v3 = Common.map (catch_clause env) v3 in
       let v4 =
         match v4 with
         | `Catch_clause x ->
@@ -2415,7 +2359,7 @@ and statement (env : env) (x : CST.statement) =
             let v1 = (* "(" *) token env v1 in
             let v2 = G.ExprStmt (expression env v2, fk v1) |> G.s in
             let v3 =
-              List.map
+              Common.map
                 (fun (v1, v2) ->
                   let v1 = (* "," *) token env v1 in
                   let v2 = G.ExprStmt (expression env v2, fk v1) |> G.s in
@@ -2433,7 +2377,7 @@ and switch_case (env : env) ((v1, v2, v3, v4) : CST.switch_case) =
   let v1 = (* "case" *) token env v1 in
   let v2 = expression env v2 in
   let _v3 = (* ":" *) token env v3 in
-  let v4 = List.map (statement env) v4 in
+  let v4 = Common.map (statement env) v4 in
   (* Q: Also, this is terrible.... Make expression more specific to be pattern? How to handle? *)
   (* G.CasesAndBody([Case(v1, OtherPat(OP_Expr, [G.E(v2)]))], G.Block(G.fake_bracket v4) |> G.s) *)
   (* Well can also do this... *)
@@ -2444,7 +2388,7 @@ and switch_case (env : env) ((v1, v2, v3, v4) : CST.switch_case) =
 and switch_default (env : env) ((v1, v2, v3) : CST.switch_default) =
   let v1 = (* "default" *) token env v1 in
   let _v2 = (* ":" *) token env v2 in
-  let v3 = List.map (statement env) v3 in
+  let v3 = Common.map (statement env) v3 in
   (* Q: Again. Is it appropriate to use Block here? *)
   G.CasesAndBody ([ G.Default v1 ], G.Block (G.fake_bracket v3) |> G.s)
 
@@ -2452,7 +2396,7 @@ and _trait_use_clause (env : env) ((v1, v2, v3, v4) : CST.trait_use_clause) =
   let v1 = (* "use" *) token env v1 in
   let v2 = type_ env v2 in
   let v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = type_ env v2 in
@@ -2464,7 +2408,7 @@ and _trait_use_clause (env : env) ((v1, v2, v3, v4) : CST.trait_use_clause) =
     | `LCURL_rep_choice_trait_select_clause_SEMI_RCURL (v1, v2, v3) ->
         let v1 = (* "{" *) token env v1 in
         let v2 =
-          List.map
+          Common.map
             (fun (v1, v2) ->
               let v1 =
                 match v1 with
@@ -2481,12 +2425,10 @@ and _trait_use_clause (env : env) ((v1, v2, v3, v4) : CST.trait_use_clause) =
   in
   todo env (v1, v2, v3, v4)
 
-and type_ env x = type_kind env x |> G.t
-
-and type_kind (env : env) (x : CST.type_) : G.type_kind =
+and type_ (env : env) (x : CST.type_) : G.type_ =
   match x with
   | `Type_spec (v1, v2, v3) ->
-      let _v1TODO = List.map (type_modifier env) v1 in
+      let _v1TODO = Common.map (type_modifier env) v1 in
       let v3 =
         match v3 with
         | Some x -> type_arguments env x
@@ -2494,35 +2436,36 @@ and type_kind (env : env) (x : CST.type_) : G.type_kind =
       in
       let v2 =
         match v2 with
-        | `Choice_bool x -> G.TyBuiltin (primitive_type env x)
+        | `Choice_bool x -> G.ty_builtin (primitive_type env x)
         | `Qual_id x ->
-            G.TyN (add_type_args_to_name (qualified_identifier env x) v3)
-        | `Choice_array x -> G.TyBuiltin (collection_type env x)
+            let xs = qualified_identifier env x in
+            let n = H2.name_of_ids xs in
+            G.TyN (H2.add_type_args_opt_to_name n v3) |> G.t
+        | `Choice_array x -> G.ty_builtin (collection_type env x)
         | `Choice_xhp_id x ->
-            G.TyN
-              (add_type_args_to_name
-                 (Id (xhp_identifier_ env x, G.empty_id_info ()))
-                 v3)
+            let id = xhp_identifier_ env x in
+            let n = H2.name_of_id id in
+            G.TyN (H2.add_type_args_opt_to_name n v3) |> G.t
       in
       v2
   | `Type_cst (v1, v2) ->
       (* TODO: What to do with modifier? *)
-      let _v1TODO = List.map (type_modifier env) v1 in
+      let _v1TODO = Common.map (type_modifier env) v1 in
       let v2 = type_constant_ env v2 in
-      G.TyN v2
+      G.TyN (H2.name_of_ids v2) |> G.t
   | `Shape_type_spec (v1, v2, v3, v4, v5) ->
-      let _v1TODO = List.map (type_modifier env) v1 in
+      let _v1TODO = Common.map (type_modifier env) v1 in
       let v2 = (* "shape" *) token env v2 in
       let v3 = (* "(" *) token env v3 in
       let v4 =
         match v4 with
         | Some (v1, v2, v3) ->
-            let v1 = G.FieldStmt (shape_field_specifier env v1 |> G.s) in
+            let v1 = G.F (shape_field_specifier env v1 |> G.s) in
             let v2 =
-              List.map
+              Common.map
                 (fun (v1, v2) ->
                   let _v1 = (* "," *) token env v1 in
-                  let v2 = G.FieldStmt (shape_field_specifier env v2 |> G.s) in
+                  let v2 = G.F (shape_field_specifier env v2 |> G.s) in
                   v2)
                 v2
             in
@@ -2535,9 +2478,9 @@ and type_kind (env : env) (x : CST.type_) : G.type_kind =
         | None -> []
       in
       let v5 = (* ")" *) token env v5 in
-      G.TyRecordAnon (v2, (v3, v4, v5))
+      G.TyRecordAnon ((G.Class, v2), (v3, v4, v5)) |> G.t
   | `Func_type_spec (v1, v2, v3, v4, v5, v6, v7, v8) ->
-      let _v1TODO = List.map (type_modifier env) v1 in
+      let _v1TODO = Common.map (type_modifier env) v1 in
       let _v2 = (* "(" *) token env v2 in
       let _v3TODO = (* pattern function\s*\( *) token env v3 in
       let v4 =
@@ -2548,14 +2491,14 @@ and type_kind (env : env) (x : CST.type_) : G.type_kind =
               | Some tok -> (* "inout" *) Some (token env tok)
               | None -> None
             in
-            let v2 = G.ParamClassic (G.param_of_type (type_ env v2)) in
+            let v2 = G.Param (G.param_of_type (type_ env v2)) in
             let _v3TODO =
               match v3 with
               | Some tok -> (* "..." *) Some (token env tok)
               | None -> None
             in
             let v4 =
-              List.map
+              Common.map
                 (fun (v1, v2, v3, v4) ->
                   (* TODO: Handle `...` *)
                   let _v1 = (* "," *) token env v1 in
@@ -2567,7 +2510,7 @@ and type_kind (env : env) (x : CST.type_) : G.type_kind =
                   in
                   let v3 =
                     let param = G.param_of_type (type_ env v3) in
-                    G.ParamClassic { param with pattrs = v2 }
+                    G.Param { param with pattrs = v2 }
                   in
                   let _v4TODO =
                     match v4 with
@@ -2589,13 +2532,13 @@ and type_kind (env : env) (x : CST.type_) : G.type_kind =
       let _v6 = (* ":" *) token env v6 in
       let v7 = type_ env v7 in
       let _v8 = (* ")" *) token env v8 in
-      G.TyFun (v4, v7)
+      G.TyFun (v4, v7) |> G.t
   | `Tuple_type_spec (v1, v2, v3, v4, v5, v6) ->
-      let _v1TODO = List.map (type_modifier env) v1 in
+      let _v1TODO = Common.map (type_modifier env) v1 in
       let v2 = (* "(" *) token env v2 in
       let v3 = type_ env v3 in
       let v4 =
-        List.map
+        Common.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = type_ env v2 in
@@ -2608,7 +2551,7 @@ and type_kind (env : env) (x : CST.type_) : G.type_kind =
         | None -> None
       in
       let v6 = (* ")" *) token env v6 in
-      G.TyTuple (v2, v3 :: v4, v6)
+      G.TyTuple (v2, v3 :: v4, v6) |> G.t
 
 and type_arguments (env : env) ((v1, v2, v3) : CST.type_arguments) :
     G.type_arguments option =
@@ -2618,7 +2561,7 @@ and type_arguments (env : env) ((v1, v2, v3) : CST.type_arguments) :
     | Some (v1, v2, v3) ->
         let v1 = G.TA (type_ env v1) in
         let v2 =
-          List.map
+          Common.map
             (fun (v1, v2) ->
               let _v1 = (* "," *) token env v1 in
               let v2 = G.TA (type_ env v2) in
@@ -2645,7 +2588,7 @@ and type_const_declaration (env : env)
     | Some x -> attribute_modifier env x
     | None -> []
   in
-  let v2 = List.map (member_modifier env) v2 in
+  let v2 = Common.map (member_modifier env) v2 in
   let v3 = (* "const" *) [ G.KeywordAttr (Const, token env v3) ] in
   let _v4 = (* "type" *) token env v4 in
   let id = semgrep_extended_identifier env v5 in
@@ -2711,7 +2654,7 @@ and type_parameter (env : env) ((v1, v2, v3, v4) : CST.type_parameter) :
     (* pattern [a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]* *) str env v3
   in
   let tp_bounds =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1TODO =
           match v1 with
@@ -2722,15 +2665,14 @@ and type_parameter (env : env) ((v1, v2, v3, v4) : CST.type_parameter) :
         v2)
       v4
   in
-  let tp_constraints = [] in
   let tp_default = None in
-  { G.tp_id; tp_attrs; tp_bounds; tp_variance; tp_default; tp_constraints }
+  TP { G.tp_id; tp_attrs; tp_bounds; tp_variance; tp_default }
 
 and type_parameters (env : env) ((v1, v2, v3, v4, v5) : CST.type_parameters) =
   let _v1 = (* "<" *) token env v1 in
   let v2 = type_parameter env v2 in
   let v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = type_parameter env v2 in
@@ -2760,7 +2702,7 @@ and variablish (env : env) (x : CST.variablish) : G.expr =
         | None -> []
       in
       let v4 =
-        List.map
+        Common.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 =
@@ -2786,26 +2728,27 @@ and variablish (env : env) (x : CST.variablish) : G.expr =
       let v3 =
         match v3 with
         | Some x -> G.ArrayAccess (v1, (v2, expression env x, v4))
-        | None -> G.OtherExpr (OE_ArrayAppend, [])
+        | None -> G.OtherExpr (("ArrayAppend", v2), [])
       in
       v3 |> G.e
-  | `Qual_id x -> G.N (qualified_identifier env x) |> G.e
+  | `Qual_id x -> G.N (qualified_identifier env x |> H2.name_of_ids) |> G.e
   | `Paren_exp x -> parenthesized_expression env x
   | `Call_exp x -> call_expression env x
-  | `Scoped_id x -> G.N (scoped_identifier env x) |> G.e
+  | `Scoped_id x -> G.N (scoped_identifier env x |> H2.name_of_ids) |> G.e
   | `Scope_id x -> scope_identifier env x
   | `Sele_exp x -> selection_expression env x
   | `Choice_xhp_id x ->
-      G.N (G.Id (xhp_identifier_ env x, G.empty_id_info ())) |> G.e
+      let id = xhp_identifier_ env x in
+      G.N (H2.name_of_id id) |> G.e
 
 and where_clause (env : env) ((v1, v2) : CST.where_clause) =
   (* TODO: What keyword is this? *)
   (* TODO: I don't really know what this language feature is.... *)
   (* TODO: This is really wrong, because it also needs to be part of a FuncDef *)
   (* Q: Should this become a cmixins? *)
-  let _v1 = (* "where" *) token env v1 in
+  let twhere = (* "where" *) token env v1 in
   let v2 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let frst, snd, thrd = where_constraint env v1 in
         let _v2 =
@@ -2813,7 +2756,8 @@ and where_clause (env : env) ((v1, v2) : CST.where_clause) =
           | Some tok -> (* "," *) Some (token env tok)
           | None -> None
         in
-        G.OtherType (OT_Expr, [ G.T frst; G.TodoK snd; G.T thrd ]) |> G.t)
+        G.OtherType (("Where", twhere), [ G.T frst; G.TodoK snd; G.T thrd ])
+        |> G.t)
       v2
   in
   v2
@@ -2861,7 +2805,7 @@ and xhp_attribute_declaration (env : env)
   (* Q: Is this what we want to do with the keyword? *)
   let v2 = xhp_class_attribute env v2 attr_tok in
   let v3 =
-    List.map
+    Common.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = xhp_class_attribute env v2 attr_tok in
@@ -2919,14 +2863,14 @@ and xhp_class_attribute (env : env) ((v1, v2, v3, v4) : CST.xhp_class_attribute)
   (* But then it had to be enum... So did TypeDef, but then went back... *)
   let ent = G.basic_entity v2 ~attrs:(attr_tok :: v4) in
   let def = (ent, G.VarDef { vinit = v3; vtype = Some v1 }) in
-  G.FieldStmt (G.DefStmt def |> G.s)
+  G.fld def
 
 and xhp_expression (env : env) (x : CST.xhp_expression) : G.xml =
   match x with
   | `Xhp_open_close (v1, v2, v3, v4) ->
       let v1 = (* "<" *) token env v1 in
       let v2 = xhp_identifier_ env v2 in
-      let v3 = List.map (xhp_attribute env) v3 in
+      let v3 = Common.map (xhp_attribute env) v3 in
       let v4 = (* "/>" *) token env v4 in
       { xml_kind = G.XmlSingleton (v1, v2, v4); xml_attrs = v3; xml_body = [] }
   | `Xhp_open_rep_choice_xhp_str_xhp_close (v1, v2, v3) ->
@@ -2934,7 +2878,7 @@ and xhp_expression (env : env) (x : CST.xhp_expression) : G.xml =
         xhp_open env v1
       in
       let v2 =
-        List.map
+        Common.map
           (fun x ->
             match x with
             | `Xhp_str tok -> (* xhp_string *) G.XmlText (str env tok)
@@ -2959,7 +2903,7 @@ and xhp_expression (env : env) (x : CST.xhp_expression) : G.xml =
 and xhp_open (env : env) ((v1, v2, v3, v4) : CST.xhp_open) =
   let v1 = (* "<" *) token env v1 in
   let v2 = xhp_identifier_ env v2 in
-  let v3 = List.map (xhp_attribute env) v3 in
+  let v3 = Common.map (xhp_attribute env) v3 in
   let v4 = (* ">" *) token env v4 in
   (v1, v2, v3, v4)
 
@@ -2979,7 +2923,7 @@ let script (env : env) ((v1, v2) : CST.script) : G.program =
     | Some tok -> (* pattern <\?[hH][hH] *) token env tok |> ignore
     | None -> ()
   in
-  List.map (statement env) v2
+  Common.map (statement env) v2
 
 (*****************************************************************************)
 (* Entry point *)
@@ -2990,10 +2934,11 @@ let parse file =
     (fun cst ->
       let extra = Target in
       let env = { H.file; conv = H.line_col_to_pos file; extra } in
-      try script env cst
-      with Failure "not implemented" as exn ->
-        H.debug_sexp_cst_after_error (CST.sexp_of_script cst);
-        raise exn)
+      try script env cst with
+      | Failure "not implemented" as exn ->
+          let e = Exception.catch exn in
+          H.debug_sexp_cst_after_error (CST.sexp_of_script cst);
+          Exception.reraise e)
 
 let parse_expression_or_source_file str =
   let res = Tree_sitter_hack.Parse.string str in

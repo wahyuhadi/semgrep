@@ -22,6 +22,8 @@ Example: $progname java
 EOF
 }
 
+echo using `which semgrep-core`
+
 error() {
   echo "Error: $*" >&2
   exit 1
@@ -112,13 +114,15 @@ main() {
       # See the long comment in Test_parsing.parsing_common about
       # mem_limit_mb.
       semgrep-core -lang "$lang" -parsing_stats -json $project_list
-    ) > stats.json
+    ) > stats.json 2> stats.log
   )
 
   if [[ "$with_upload" = true ]]; then
     ./upload-parsing-rates lang/"$lang"/stats.json
   fi
   echo "stats available in lang/$lang/stats.json"
+  #alt: cat lang/$lang/stats.json | jq .global
+  semgrep-core -lang json -e '"global": { ... }' lang/"$lang"/stats.json
 }
 
 main

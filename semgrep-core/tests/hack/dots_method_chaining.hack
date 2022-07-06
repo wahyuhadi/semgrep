@@ -14,9 +14,10 @@ $eof = <<<EOF
 {$var->test1()->test_made()}
 EOF;
 
+//ERROR: match, ellipsis can also match 0 elts
 $var->test_made();
 
-$var->test->test_made(); // `test` is not a method call
-                         // so it will not match
+// ERROR:
+$var->test->test_made();
 
 $test->test1()->test_made();

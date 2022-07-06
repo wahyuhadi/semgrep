@@ -14,6 +14,9 @@ let string_of_lval x =
 let string_of_exp e =
   match e.e with
   | Fetch l -> string_of_lval l
+  | Literal _ -> "<LIT>"
+  | Operator _ -> "<OP>"
+  | FixmeExp _ -> "<FIXME-EXP>"
   | _ -> "<EXP>"
 
 let short_string_of_node_kind nkind =
@@ -24,16 +27,24 @@ let short_string_of_node_kind nkind =
   | FalseNode -> "<FALSE path>"
   | Join -> "<join>"
   | NCond _ -> "cond(...)"
-  | NGoto (_, n) -> "goto " ^ str_of_name n
+  | NGoto (_, l) -> "goto " ^ str_of_label l
   | NReturn _ -> "return ...;"
   | NThrow _ -> "throw ...;"
+  | NOther (Noop str) -> Common.spf "<noop: %s>" str
   | NOther _ -> "<other>"
   | NInstr x -> (
       match x.i with
-      | Assign (lval, _) -> string_of_lval lval ^ " = ..."
+      | Assign (lval, exp) -> string_of_lval lval ^ " = " ^ string_of_exp exp
       | AssignAnon _ -> " ... = <lambda|class>"
       | Call (_lopt, exp, _) -> string_of_exp exp ^ "(...)"
-      | CallSpecial _ -> "<special>"
+      | CallSpecial (lval_opt, (call_special, _tok), _args) ->
+          let lval_str =
+            match lval_opt with
+            | None -> ""
+            | Some lval -> Common.spf " %s =" (string_of_lval lval)
+          in
+          Common.spf "<special>%s %s(...)" lval_str
+            (IL.show_call_special call_special)
       | FixmeInstr _ -> "<fix-me instr>")
   | NTodo _ -> "<to-do stmt>"
 

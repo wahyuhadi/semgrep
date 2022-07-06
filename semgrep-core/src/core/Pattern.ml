@@ -55,6 +55,8 @@ let is_js lang =
 
 (* This is used in Analyze_pattern.ml to skip
  * semgrep special identifiers.
+ * new TODO: instead of relying on this list of exceptions, set id_hidden=true
+ * in the AST.
  *)
 let is_special_identifier ?lang str =
   Metavariable.is_metavar_name str
@@ -69,4 +71,4 @@ let is_special_identifier ?lang str =
   (* parser_java.mly inserts some implicit this *)
   || (lang = Some Lang.Java && str = "this")
   || (* TODO: PHP converts some Eval in __builtin *)
-  (lang = Some Lang.PHP && str =~ "__builtin__*")
+  (lang = Some Lang.Php && str =~ "__builtin__*")

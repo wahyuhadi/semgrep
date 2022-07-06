@@ -3,7 +3,6 @@
  (libraries
     str
     dyp
-    parmap
     ppx_deriving.runtime
     uucp uutf
 
@@ -33,16 +32,13 @@
 
     ; internal deps
     semgrep_core
+    semgrep_running
     semgrep_metachecking
-    semgrep_parsing
-    semgrep_matching
-    semgrep_analyzing
-    semgrep_reporting
-    semgrep_synthesizing
-    semgrep_engine
-    semgrep_testing
-    semgrep_api
     semgrep_system
+
+    ; experiments
+    semgrep_synthesizing
+    semgrep_api
  )
  (preprocess (pps ppx_profiling))
  ; for ocamldebug

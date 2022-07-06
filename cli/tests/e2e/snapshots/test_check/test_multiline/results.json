@@ -1,0 +1,68 @@
+{
+  "errors": [],
+  "paths": {
+    "_comment": "<add --verbose for a list of skipped paths>",
+    "scanned": [
+      "targets/multiline/stupid.py"
+    ]
+  },
+  "results": [
+    {
+      "check_id": "rules.eqeq-is-bad",
+      "end": {
+        "col": 55,
+        "line": 8,
+        "offset": 213
+      },
+      "extra": {
+        "fingerprint": "52058caf3f1a443e6baa9336c841d378f7a70bf9ae99de911627661cb41108ef857412c92d23f80603fd235ddb1989dee8a39be9888b57c5279cf3d6d92b8ff5_0",
+        "is_ignored": false,
+        "lines": "        SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK\n        == SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK",
+        "message": "useless comparison operation `SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK == SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK` or `SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK != SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK`; possible bug?",
+        "metadata": {
+          "shortlink": "https://sg.run/xyz1"
+        },
+        "metavars": {
+          "$X": {
+            "abstract_content": "SUPER_LONG_CONSTANT_TO_TRIGGER_A_LINE_BREAK",
+            "end": {
+              "col": 52,
+              "line": 7,
+              "offset": 158
+            },
+            "propagated_value": {
+              "svalue_abstract_content": "0",
+              "svalue_end": {
+                "col": 48,
+                "line": 1,
+                "offset": 47
+              },
+              "svalue_start": {
+                "col": 47,
+                "line": 1,
+                "offset": 46
+              }
+            },
+            "start": {
+              "col": 9,
+              "line": 7,
+              "offset": 115
+            },
+            "unique_id": {
+              "sid": 1,
+              "type": "id"
+            }
+          }
+        },
+        "severity": "ERROR"
+      },
+      "path": "targets/multiline/stupid.py",
+      "start": {
+        "col": 9,
+        "line": 7,
+        "offset": 115
+      }
+    }
+  ],
+  "version": "0.42"
+}

@@ -1,1 +1,0 @@
---dump_ast and -l/--lang must both be specified
