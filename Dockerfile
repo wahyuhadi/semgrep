@@ -60,7 +60,7 @@ RUN /semgrep/semgrep-core/_build/default/src/cli/Main.exe -version
 # We change container, bringing the 'semgrep-core' binary with us.
 #
 
-FROM python:3.10-alpine AS semgrep-cli
+FROM python:3.11.0-alpine AS semgrep-cli
 
 WORKDIR /semgrep
 
